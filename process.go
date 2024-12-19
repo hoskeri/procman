@@ -1,17 +1,53 @@
 package procman
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"strings"
+
+	"github.com/mattn/go-shellwords"
 )
+
+type Formation struct {
+	Workdir string
+	Getenv  func(string) string
+}
 
 type Process struct {
 	Name    string
-	Environ []string
 	CmdArgs []string
+}
+
+func (l *Formation) Load(src io.Reader) ([]Process, error) {
+	sc := bufio.NewScanner(src)
+	ps := []Process{}
+	for sc.Scan() {
+		line := sc.Text()
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		name, cmd, found := strings.Cut(line, ":")
+		if !found {
+			return nil, errors.New("invalid line")
+		}
+
+		cmdArgs, err := shellwords.Parse(cmd)
+		if err != nil {
+			return nil, err
+		}
+
+		ps = append(ps, Process{
+			Name:    name,
+			CmdArgs: cmdArgs,
+		})
+	}
+	return ps, nil
 }
 
 type runOptions struct {
@@ -39,14 +75,13 @@ func (p *Process) Run(ctx context.Context, opt ...Option) error {
 
 	o.Apply(opt...)
 
-	stdOutWriter := newPrefixWriter(o.output, fmt.Sprintf("%-10s O | ", p.Name))
-	stdErrWriter := newPrefixWriter(o.output, fmt.Sprintf("%-10s E | ", p.Name))
+	stdOutWriter := newPrefixWriter(o.output, fmt.Sprintf("%-10s | ", p.Name))
+	stdErrWriter := newPrefixWriter(o.output, fmt.Sprintf("%-10s | ", p.Name))
 
 	cmd := &exec.Cmd{
 		Args:   p.CmdArgs,
 		Path:   p.CmdArgs[0],
-		Env:    p.Environ,
-		Stdin:  os.Stdin,
+		Stdin:  nil,
 		Stdout: stdOutWriter,
 		Stderr: stdErrWriter,
 	}

@@ -2,8 +2,35 @@ package procman
 
 import (
 	"bytes"
+	"context"
 	"io"
+	"os"
 )
+
+type Logger struct {
+	o     io.Writer
+	queue <-chan []byte
+}
+
+func NewLogger() *Logger {
+	return &Logger{
+		o:     os.Stdout,
+		queue: make(chan []byte, 128),
+	}
+}
+
+func (l *Logger) Run(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case line := <-l.queue:
+			if _, err := l.o.Write(line); err != nil {
+				return err
+			}
+		}
+	}
+}
 
 type prefixWriter struct {
 	writer  io.Writer
