@@ -14,14 +14,14 @@ func TestProcess(t *testing.T) {
 	wantOutput := "hello      | stderr\nhello      | stdout\n"
 
 	p := &Process{
-		Name: "hello",
+		Tag: "hello",
 		CmdArgs: []string{
 			"/usr/bin/sh", "-c",
 			">&2 echo stderr; echo stdout",
 		},
 	}
 
-	err := p.Run(context.Background(), WithOutput(tw))
+	err := p.run(context.Background(), WithOutput(tw))
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -34,14 +34,14 @@ func TestProcess(t *testing.T) {
 func TestFormation(t *testing.T) {
 	testCases := []struct {
 		data string
-		want []Process
+		want []*Process
 		err  error
 	}{
 		{
 			data: "web: ./webserver \"hello world\"\ndb: ./mysql 'a b c'",
-			want: []Process{
-				{Name: "web", CmdArgs: []string{"./webserver", "hello world"}},
-				{Name: "db", CmdArgs: []string{"./mysql", "a b c"}},
+			want: []*Process{
+				{Tag: "web", CmdArgs: []string{"./webserver", "hello world"}},
+				{Tag: "db", CmdArgs: []string{"./mysql", "a b c"}},
 			},
 		},
 	}
@@ -49,11 +49,11 @@ func TestFormation(t *testing.T) {
 	for _, tc := range testCases {
 		frm := &Formation{}
 
-		pf, err := frm.Load(strings.NewReader(tc.data))
+		err := frm.Load(strings.NewReader(tc.data))
 		if err != nil {
 			t.Fatalf("%v", err)
 		}
-		if diff := cmp.Diff(pf, tc.want); diff != "" {
+		if diff := cmp.Diff(frm.Processes, tc.want); diff != "" {
 			t.Fatalf("unexpected diff, (-want, +got) %s", diff)
 		}
 	}
