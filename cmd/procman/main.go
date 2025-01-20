@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"log"
-	"os"
 	"os/signal"
 	"syscall"
 
@@ -12,17 +11,8 @@ import (
 
 func main() {
 	log.SetFlags(log.Lmsgprefix | log.Lshortfile | log.LstdFlags)
-	f, err := os.Open("Procfile")
+	fm, err := procman.New("Procfile")
 	if err != nil {
-		log.Fatalf("%v", err)
-	}
-
-	fm, err := procman.New()
-	if err != nil {
-		log.Fatalf("%v", err)
-	}
-
-	if err := fm.Load(f); err != nil {
 		log.Fatalf("%v", err)
 	}
 

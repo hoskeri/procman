@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -16,6 +15,8 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+var logger = slog.Default()
+
 // Process represents a running process
 type Process struct {
 	// Short Tag representing the type of process.
@@ -24,7 +25,7 @@ type Process struct {
 	Index int
 	// Actual resolved environment.
 	Environ []string
-	// Actual command line, include executable.
+	// Actual command line, including executable.
 	CmdArgs []string
 	// Working directory
 	Workdir string
@@ -34,10 +35,31 @@ type Formation struct {
 	WorkDir   string
 	Env       func(string) string
 	Processes []*Process
+	Sink      *slog.Logger
 }
 
-func New() (*Formation, error) {
-	return &Formation{}, nil
+func New(fpath string) (*Formation, error) {
+	f := &Formation{
+		Sink: slog.Default(),
+	}
+	if err := f.LoadFile(fpath); err != nil {
+		return nil, err
+	}
+
+	return f, nil
+}
+
+func (l *Formation) LoadFile(fpath string) error {
+	if fpath == "" {
+		return nil
+	}
+
+	src, err := os.Open("Procfile")
+	if err != nil {
+		return err
+	}
+
+	return l.Load(src)
 }
 
 func (l *Formation) Load(src io.Reader) error {
@@ -89,16 +111,23 @@ func (l *Formation) Run(ctx context.Context) error {
 
 	for _, p := range l.Processes {
 		eg.Go(func() error {
-			return p.run(ctx)
+			logger.Info("formation.run", "start", p)
+			err := p.run(ctx, WithLogger(l.Sink))
+			logger.Info("formation.run", "exit", p, "err", err)
+			return err
 		})
 	}
 
+	logger.Info("formation.run, process start complete, waiting")
 	<-ctx.Done()
-	return ctx.Err()
+	egErr := eg.Wait()
+	ctxErr := ctx.Err()
+	logger.Info("formation.run, done waiting", "egErr", egErr, "ctxErr", ctxErr)
+	return egErr
 }
 
 type runOptions struct {
-	output io.Writer
+	logger *slog.Logger
 }
 
 func (ro *runOptions) Apply(os ...Option) {
@@ -109,31 +138,37 @@ func (ro *runOptions) Apply(os ...Option) {
 
 type Option func(o *runOptions)
 
-func WithOutput(output io.Writer) Option {
+func WithLogger(l *slog.Logger) Option {
 	return func(o *runOptions) {
-		o.output = output
+		o.logger = l
 	}
 }
 
 func (p *Process) run(ctx context.Context, opt ...Option) error {
 	o := &runOptions{
-		output: os.Stdout,
+		logger: slog.Default(),
 	}
-
 	o.Apply(opt...)
 
-	stdOutWriter := newPrefixWriter(o.output, fmt.Sprintf("%-10s | ", p.Tag))
-	stdErrWriter := newPrefixWriter(o.output, fmt.Sprintf("%-10s | ", p.Tag))
-
 	c := exec.CommandContext(ctx, p.CmdArgs[0], p.CmdArgs[1:]...)
-	c.Stdout = stdOutWriter
-	c.Stderr = stdErrWriter
+	c.Stdout = Stream(o.logger, p.Tag)
+	c.Stderr = Stream(o.logger, p.Tag)
 	c.Env = p.Environ
 	c.Dir = p.Workdir
 	c.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
-		Setsid:  true,
 	}
+	logger.Info("process.run", "run", c)
+	err := c.Run()
+	logger.Info("process.run", "exit", c, "err", err)
+	return err
+}
 
-	return c.Run()
+func (p *Process) Exec(ctx context.Context, opt ...Option) error {
+	slog.Info("p.exec", "args", p.CmdArgs)
+	e, err := exec.LookPath(p.CmdArgs[0])
+	if err != nil {
+		return err
+	}
+	return syscall.Exec(e, p.CmdArgs, p.Environ)
 }

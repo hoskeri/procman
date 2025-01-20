@@ -30,14 +30,14 @@ func (s *stream) Write(p []byte) (int, error) {
 			s.buf.Write(got)
 			break
 		}
-		s.sink.Info(string(got))
+		s.sink.LogAttrs(nil, slog.LevelInfo, string(got))
 	}
 	return len(p), nil
 }
 
-func Stream(sink *slog.Logger, tag string, index, fd int) io.Writer {
+func Stream(sink *slog.Logger, tag string) io.Writer {
 	return &stream{
 		buf:  bytes.NewBuffer(make([]byte, 0, maxLineLength)),
-		sink: sink.With("tag", tag, "index", index, "fd", fd),
+		sink: sink.With("tag", tag),
 	}
 }

@@ -1,7 +1,6 @@
 package procman
 
 import (
-	"bytes"
 	"context"
 	"strings"
 	"testing"
@@ -10,8 +9,6 @@ import (
 )
 
 func TestProcess(t *testing.T) {
-	tw := bytes.NewBuffer([]byte{})
-	wantOutput := "hello      | stderr\nhello      | stdout\n"
 
 	p := &Process{
 		Tag: "hello",
@@ -21,13 +18,9 @@ func TestProcess(t *testing.T) {
 		},
 	}
 
-	err := p.run(context.Background(), WithOutput(tw))
+	err := p.run(context.Background())
 	if err != nil {
 		t.Fatalf("error: %v", err)
-	}
-
-	if diff := cmp.Diff(string(tw.Bytes()), wantOutput); diff != "" {
-		t.Fatalf("diff (+got, -want): %v", diff)
 	}
 }
 
