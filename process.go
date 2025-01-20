@@ -96,6 +96,7 @@ func (l *Formation) Load(src io.Reader) error {
 		ps = append(ps, &Process{
 			Tag:     name,
 			CmdArgs: cmdArgs,
+			Environ: baseEnv(),
 		})
 	}
 
@@ -136,6 +137,19 @@ func (ro *runOptions) Apply(os ...Option) {
 	}
 }
 
+func baseEnv() []string {
+	var ret []string
+	for _, e := range []string{
+		"PATH",
+		"HOME",
+		"USERNAME",
+		"LOGNAME",
+	} {
+		ret = append(ret, e+"="+os.Getenv(e))
+	}
+	return ret
+}
+
 type Option func(o *runOptions)
 
 func WithLogger(l *slog.Logger) Option {
@@ -153,7 +167,10 @@ func (p *Process) run(ctx context.Context, opt ...Option) error {
 	c := exec.CommandContext(ctx, p.CmdArgs[0], p.CmdArgs[1:]...)
 	c.Stdout = Stream(o.logger, p.Tag)
 	c.Stderr = Stream(o.logger, p.Tag)
-	c.Env = p.Environ
+	c.Env = baseEnv()
+	if len(p.Environ) > 0 {
+		c.Env = p.Environ
+	}
 	c.Dir = p.Workdir
 	c.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
