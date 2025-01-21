@@ -38,6 +38,6 @@ func (s *stream) Write(p []byte) (int, error) {
 func Stream(sink *slog.Logger, tag string) io.Writer {
 	return &stream{
 		buf:  bytes.NewBuffer(make([]byte, 0, maxLineLength)),
-		sink: sink.With("tag", tag),
+		sink: sink.WithGroup(tag),
 	}
 }

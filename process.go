@@ -182,7 +182,7 @@ func (p *Process) run(ctx context.Context, opt ...Option) error {
 }
 
 func (p *Process) Exec(ctx context.Context, opt ...Option) error {
-	slog.Info("p.exec", "args", p.CmdArgs)
+	slog.Debug("p.exec", "args", p.CmdArgs)
 	e, err := exec.LookPath(p.CmdArgs[0])
 	if err != nil {
 		return err
