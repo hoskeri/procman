@@ -20,7 +20,8 @@ const (
 )
 
 type Options struct {
-	Level slog.Leveler
+	Level   slog.Leveler
+	Columns int
 }
 
 type TermHandler struct {
@@ -57,8 +58,11 @@ func (h *TermHandler) Handle(ctx context.Context, rec slog.Record) error {
 
 	buf := []byte(ansiBrightGreen + h.group + ansiReset + rec.Message)
 	l := len(buf)
-	if l > 255 {
-		l = 255
+
+	if h.opts.Columns > 0 {
+		if l > h.opts.Columns {
+			l = h.opts.Columns
+		}
 	}
 
 	if buf[l-1] != '\n' {

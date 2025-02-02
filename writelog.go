@@ -7,8 +7,6 @@ import (
 	"sync"
 )
 
-const maxLineLength = 256
-
 type stream struct {
 	mu   sync.Mutex
 	sink *slog.Logger
@@ -37,7 +35,7 @@ func (s *stream) Write(p []byte) (int, error) {
 
 func Stream(sink *slog.Logger, tag string) io.Writer {
 	return &stream{
-		buf:  bytes.NewBuffer(make([]byte, 0, maxLineLength)),
+		buf:  bytes.NewBuffer(make([]byte, 0, 256)),
 		sink: sink.WithGroup(tag),
 	}
 }

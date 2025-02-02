@@ -4,12 +4,15 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/mattn/go-shellwords"
 	"golang.org/x/sync/errgroup"
@@ -54,10 +57,12 @@ func (l *Formation) LoadFile(fpath string) error {
 		return nil
 	}
 
-	src, err := os.Open("Procfile")
+	src, err := os.Open(fpath)
 	if err != nil {
 		return err
 	}
+
+	l.WorkDir = path.Dir(fpath)
 
 	return l.Load(src)
 }
@@ -112,18 +117,16 @@ func (l *Formation) Run(ctx context.Context) error {
 
 	for _, p := range l.Processes {
 		eg.Go(func() error {
-			logger.Info("formation.run", "start", p)
+			logger := l.Sink.WithGroup("procman")
+			logger.Info(fmt.Sprintf("%s starting\n", p.Tag))
 			err := p.run(ctx, WithLogger(l.Sink))
-			logger.Info("formation.run", "exit", p, "err", err)
+			logger.Info(fmt.Sprintf("%s exited\n", p.Tag))
 			return err
 		})
 	}
 
-	logger.Info("formation.run, process start complete, waiting")
 	<-ctx.Done()
 	egErr := eg.Wait()
-	ctxErr := ctx.Err()
-	logger.Info("formation.run, done waiting", "egErr", egErr, "ctxErr", ctxErr)
 	return egErr
 }
 
@@ -137,14 +140,8 @@ func (ro *runOptions) Apply(os ...Option) {
 	}
 }
 
-func baseEnv() []string {
-	var ret []string
-	for _, e := range []string{
-		"PATH",
-		"HOME",
-		"USERNAME",
-		"LOGNAME",
-	} {
+func baseEnv() (ret []string) {
+	for _, e := range []string{"PATH", "HOME", "USERNAME", "LOGNAME"} {
 		ret = append(ret, e+"="+os.Getenv(e))
 	}
 	return ret
@@ -167,6 +164,7 @@ func (p *Process) run(ctx context.Context, opt ...Option) error {
 	c := exec.CommandContext(ctx, p.CmdArgs[0], p.CmdArgs[1:]...)
 	c.Stdout = Stream(o.logger, p.Tag)
 	c.Stderr = Stream(o.logger, p.Tag)
+	c.WaitDelay = 10 * time.Second
 	c.Env = baseEnv()
 	if len(p.Environ) > 0 {
 		c.Env = p.Environ
@@ -175,9 +173,7 @@ func (p *Process) run(ctx context.Context, opt ...Option) error {
 	c.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
-	logger.Info("process.run", "run", c)
 	err := c.Run()
-	logger.Info("process.run", "exit", c, "err", err)
 	return err
 }
 
