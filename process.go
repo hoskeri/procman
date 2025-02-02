@@ -18,8 +18,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-var logger = slog.Default()
-
 // Process represents a running process
 type Process struct {
 	// Short Tag representing the type of process.
