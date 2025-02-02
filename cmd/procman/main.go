@@ -14,7 +14,6 @@ import (
 )
 
 func main() {
-
 	var procfile string
 	var dotenv string
 	flag.StringVar(&procfile, "procfile", "Procfile", "path to Procfile")

@@ -5,28 +5,45 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
+	"os"
 	"sync"
+
+	"github.com/nerdmaster/terminal"
 )
 
 // ANSI modes
 const (
-	ansiReset          = "\033[0m"
-	ansiFaint          = "\033[2m"
-	ansiResetFaint     = "\033[22m"
-	ansiBrightRed      = "\033[91m"
-	ansiBrightGreen    = "\033[92m"
-	ansiBrightYellow   = "\033[93m"
-	ansiBrightRedFaint = "\033[91;2m"
+	ansiReset = "\033[0m"
+	ansiBold  = "\033[1m"
 )
+
+var fgcolors = []string{
+	"\033[38;5;2m",
+	"\033[38;5;3m",
+	"\033[38;5;4m",
+	"\033[38;5;5m",
+	"\033[38;5;6m",
+	"\033[38;5;9m",
+	"\033[38;5;10m",
+	"\033[38;5;11m",
+	"\033[38;5;12m",
+}
+
+func randomColor() string {
+	return fgcolors[rand.Intn(len(fgcolors))]
+}
 
 type Options struct {
 	Level   slog.Leveler
 	Columns int
+	Colors  bool
 }
 
 type TermHandler struct {
 	opts  Options
 	group string
+	color string
 	attrs []slog.Attr
 	mu    *sync.Mutex
 	out   io.Writer
@@ -34,7 +51,7 @@ type TermHandler struct {
 
 var _ slog.Handler = &TermHandler{}
 
-func New(out io.Writer, opts *Options) *TermHandler {
+func New(out *os.File, opts *Options) *TermHandler {
 	h := &TermHandler{out: out, mu: &sync.Mutex{}}
 	if opts != nil {
 		h.opts = *opts
@@ -42,6 +59,13 @@ func New(out io.Writer, opts *Options) *TermHandler {
 
 	if h.opts.Level == nil {
 		h.opts.Level = slog.LevelInfo
+	}
+
+	a, err := out.SyscallConn()
+	if err == nil {
+		a.Control(func(fd uintptr) {
+			h.opts.Colors = terminal.IsTerminal(int(fd))
+		})
 	}
 
 	return h
@@ -56,7 +80,7 @@ func (h *TermHandler) Handle(ctx context.Context, rec slog.Record) error {
 		return nil
 	}
 
-	buf := []byte(ansiBrightGreen + h.group + ansiReset + rec.Message)
+	buf := []byte(ansiBold + h.color + h.group + ansiReset + rec.Message)
 	l := len(buf)
 
 	if h.opts.Columns > 0 {
@@ -83,5 +107,8 @@ func (h *TermHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 func (h *TermHandler) WithGroup(name string) slog.Handler {
 	h2 := *h
 	h2.group = fmt.Sprintf("%16s | ", name)
+	if h2.opts.Colors {
+		h2.color = randomColor()
+	}
 	return &h2
 }
