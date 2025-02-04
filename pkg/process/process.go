@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -35,8 +36,7 @@ type Process struct {
 }
 
 type Formation struct {
-	WorkDir   string
-	Env       func(string) string
+	Workdir   string
 	Processes []*Process
 	Sink      *slog.Logger
 }
@@ -62,7 +62,14 @@ func (l *Formation) LoadFile(fpath string) error {
 		return err
 	}
 
-	l.WorkDir = path.Dir(fpath)
+	l.Workdir, _ = filepath.Abs(path.Dir(fpath))
+
+	if l.Workdir != "" {
+		slog.Info("switching to workdir", "workdir", l.Workdir)
+		if err := os.Chdir(l.Workdir); err != nil {
+			return err
+		}
+	}
 
 	return l.Load(src)
 }
@@ -102,6 +109,7 @@ func (l *Formation) Load(src io.Reader) error {
 			Tag:     name,
 			CmdArgs: cmdArgs,
 			Environ: baseEnv(),
+			Workdir: l.Workdir,
 		})
 	}
 
@@ -141,7 +149,15 @@ func (ro *runOptions) Apply(os ...Option) {
 }
 
 func baseEnv() (ret []string) {
-	for _, e := range []string{"PATH", "HOME", "USERNAME", "LOGNAME"} {
+	for _, e := range []string{
+		"PATH",
+		"HOME",
+		"USERNAME",
+		"LOGNAME",
+		"SHELL",
+		"TERM",
+		"LANG",
+	} {
 		ret = append(ret, e+"="+os.Getenv(e))
 	}
 	return ret
@@ -161,6 +177,9 @@ func (p *Process) run(ctx context.Context, opt ...Option) error {
 	}
 	o.Apply(opt...)
 
+	wd, _ := os.Getwd()
+	slog.Info("workdir", "dir", wd)
+
 	c := exec.CommandContext(ctx, p.CmdArgs[0], p.CmdArgs[1:]...)
 	c.Stdout = writelog.Stream(o.logger, p.Tag)
 	c.Stderr = writelog.Stream(o.logger, p.Tag)
@@ -173,7 +192,10 @@ func (p *Process) run(ctx context.Context, opt ...Option) error {
 	c.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
+
+	slog.Info("c.run", "c.args", p.CmdArgs)
 	err := c.Run()
+	slog.Info("c.exit", "err", err)
 	return err
 }
 

@@ -4,7 +4,8 @@ Runs Heroku style [Procfile][procfile] process definitions.
 
 You are probably looking for something like github.com/ddollar/foreman
 
-This exists because I need something that's embeddable in other golang applications.
+Exists because I need something that's embeddable in other golang applications.
+You probably want https://github.com/ddollar/foreman instead for now.
 
 ## Work in Progress
 

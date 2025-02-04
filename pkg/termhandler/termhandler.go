@@ -3,9 +3,9 @@ package termhandler
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
-	"math/rand"
 	"os"
 	"sync"
 
@@ -30,10 +30,14 @@ var fgcolors = []string{
 	"\033[38;5;11m",
 	"\033[38;5;12m",
 	"\033[38;5;13m",
+	"\033[38;5;15m",
 }
 
-func randomColor() string {
-	return fgcolors[rand.Intn(len(fgcolors))]
+func randomColor(tag string) string {
+	h := fnv.New32()
+	h.Write([]byte(tag))
+
+	return fgcolors[int(h.Sum32())%len(fgcolors)]
 }
 
 type Options struct {
@@ -82,6 +86,7 @@ func (h *TermHandler) Handle(ctx context.Context, rec slog.Record) error {
 		return nil
 	}
 
+	// can't possible be efficient.
 	buf := []byte(ansiBold + h.color + h.group + ansiReset + rec.Message)
 	l := len(buf)
 
@@ -110,7 +115,7 @@ func (h *TermHandler) WithGroup(name string) slog.Handler {
 	h2 := *h
 	h2.group = fmt.Sprintf("%16s | ", name)
 	if h2.opts.Colors {
-		h2.color = randomColor()
+		h2.color = randomColor(h2.group)
 	}
 	return &h2
 }

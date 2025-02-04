@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"flag"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -10,6 +11,7 @@ import (
 )
 
 func main() {
+	maxBlockDuration := flag.Duration("max-block", 15000*time.Microsecond, "max duration output is allowed to be blocked")
 	h := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
 		AddSource: false,
 	}))
@@ -26,7 +28,7 @@ func main() {
 		slog.Info("trebuchet", "blocked", blocked.String(), "buf", base64.URLEncoding.EncodeToString(buf))
 		time.Sleep(10 * time.Millisecond)
 		blocked = time.Now().Sub(begin)
-		if blocked.Microseconds() > 15000 {
+		if blocked.Microseconds() > maxBlockDuration.Microseconds() {
 			fmt.Printf("blocked for %s\n", blocked.String())
 			os.Exit(1)
 		}

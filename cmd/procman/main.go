@@ -19,6 +19,7 @@ type procFlags struct {
 	Formation string
 	Output    string
 	Workdir   string
+	Debug     bool
 }
 
 func (p *procFlags) AddFlags(fs *flag.FlagSet) {
@@ -27,24 +28,35 @@ func (p *procFlags) AddFlags(fs *flag.FlagSet) {
 	fs.StringVar(&p.Dotenv, "env", "", "path to dotenv style env file")
 	fs.StringVar(&p.Formation, "formation", "", "optional map of process type=replica-count")
 	fs.StringVar(&p.Output, "output", "auto", "output mode: auto,term,journal,syslog")
+	fs.BoolVar(&p.Debug, "debug", false, "enable debug logging")
 }
 
 func main() {
 	p := &procFlags{}
 	p.AddFlags(flag.CommandLine)
-
 	flag.Parse()
 
+	ll := slog.LevelInfo
+	if p.Debug {
+		ll = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{AddSource: false, Level: ll})))
+
 	proclogger := slog.New(termhandler.New(os.Stdout, &termhandler.Options{
-		Level: slog.LevelInfo,
+		Level: slog.LevelDebug,
 	}))
 
+	if p.Workdir == "" {
+		w := filepath.Dir(p.Procfile)
+		p.Workdir = w
+	}
+
 	fm := process.Formation{
-		WorkDir: filepath.Dir(procfile),
+		Workdir: p.Workdir,
 		Sink:    proclogger,
 	}
 
-	if err := fm.LoadFile(procfile); err != nil {
+	if err := fm.LoadFile(p.Procfile); err != nil {
 		slog.Debug("fm.LoadFile", "err", err)
 		os.Exit(1)
 	}
