@@ -27,7 +27,7 @@ func (p *procFlags) AddFlags(fs *flag.FlagSet) {
 	fs.StringVar(&p.Workdir, "workdir", "", "path to initial working dir, defaults to location of Procfile")
 	fs.StringVar(&p.Dotenv, "env", "", "path to dotenv style env file")
 	fs.StringVar(&p.Formation, "formation", "", "optional map of process type=replica-count")
-	fs.StringVar(&p.Output, "output", "auto", "output mode: auto,term,journal,syslog")
+	fs.StringVar(&p.Output, "output", "auto", "output mode: auto,term")
 	fs.BoolVar(&p.Debug, "debug", false, "enable debug logging")
 }
 

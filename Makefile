@@ -6,6 +6,6 @@ test:
 	go test -v ./...
 
 clean:
-	rm -v -f ./procman
+	@rm -v -f ./procman ./tools/trebuchet/trebuchet
 
 .PHONY: build clean

@@ -7,6 +7,8 @@ You are probably looking for something like github.com/ddollar/foreman
 Exists because I need something that's embeddable in other golang applications.
 You probably want https://github.com/ddollar/foreman instead for now.
 
+[procfile]: https://devcenter.heroku.com/articles/procfile
+
 ## Work in Progress
 
 I wouldn't recommend using this until most of these are done.
@@ -22,4 +24,3 @@ I wouldn't recommend using this until most of these are done.
 procman is licensed under the MIT license.
 See LICENSE for the full license text.
 
-[procfile]: https://devcenter.heroku.com/articles/procfile

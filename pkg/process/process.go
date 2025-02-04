@@ -65,7 +65,7 @@ func (l *Formation) LoadFile(fpath string) error {
 	l.Workdir, _ = filepath.Abs(path.Dir(fpath))
 
 	if l.Workdir != "" {
-		slog.Info("switching to workdir", "workdir", l.Workdir)
+		slog.Debug("switching to workdir", "workdir", l.Workdir)
 		if err := os.Chdir(l.Workdir); err != nil {
 			return err
 		}
@@ -133,8 +133,8 @@ func (l *Formation) Run(ctx context.Context) error {
 		})
 	}
 
-	<-ctx.Done()
 	egErr := eg.Wait()
+	<-ctx.Done()
 	return egErr
 }
 
@@ -178,7 +178,7 @@ func (p *Process) run(ctx context.Context, opt ...Option) error {
 	o.Apply(opt...)
 
 	wd, _ := os.Getwd()
-	slog.Info("workdir", "dir", wd)
+	slog.Debug("workdir", "dir", wd)
 
 	c := exec.CommandContext(ctx, p.CmdArgs[0], p.CmdArgs[1:]...)
 	c.Stdout = writelog.Stream(o.logger, p.Tag)
@@ -193,9 +193,9 @@ func (p *Process) run(ctx context.Context, opt ...Option) error {
 		Setpgid: true,
 	}
 
-	slog.Info("c.run", "c.args", p.CmdArgs)
+	slog.Debug("c.run", "c.args", p.CmdArgs)
 	err := c.Run()
-	slog.Info("c.exit", "err", err)
+	slog.Debug("c.exit", "err", err)
 	return err
 }
 
