@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/hoskeri/procman"
-	"github.com/hoskeri/procman/termhandler"
+	"github.com/hoskeri/procman/pkg/process"
+	"github.com/hoskeri/procman/pkg/termhandler"
 )
 
 func main() {
@@ -24,7 +24,7 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 
-	fm := procman.Formation{
+	fm := process.Formation{
 		WorkDir: filepath.Dir(procfile),
 		Sink:    proclogger,
 	}

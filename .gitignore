@@ -1,2 +1,4 @@
 procman
+trebuchet
+*.sw*
 !./cmd/procman

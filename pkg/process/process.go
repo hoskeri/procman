@@ -1,4 +1,4 @@
-package procman
+package process
 
 import (
 	"bufio"
@@ -16,6 +16,8 @@ import (
 
 	"github.com/mattn/go-shellwords"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/hoskeri/procman/pkg/writelog"
 )
 
 // Process represents a running process
@@ -160,8 +162,8 @@ func (p *Process) run(ctx context.Context, opt ...Option) error {
 	o.Apply(opt...)
 
 	c := exec.CommandContext(ctx, p.CmdArgs[0], p.CmdArgs[1:]...)
-	c.Stdout = Stream(o.logger, p.Tag)
-	c.Stderr = Stream(o.logger, p.Tag)
+	c.Stdout = writelog.Stream(o.logger, p.Tag)
+	c.Stderr = writelog.Stream(o.logger, p.Tag)
 	c.WaitDelay = 10 * time.Second
 	c.Env = baseEnv()
 	if len(p.Environ) > 0 {
