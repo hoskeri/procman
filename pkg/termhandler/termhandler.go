@@ -19,6 +19,7 @@ const (
 )
 
 var fgcolors = []string{
+	"\033[38;5;1m",
 	"\033[38;5;2m",
 	"\033[38;5;3m",
 	"\033[38;5;4m",
@@ -28,6 +29,7 @@ var fgcolors = []string{
 	"\033[38;5;10m",
 	"\033[38;5;11m",
 	"\033[38;5;12m",
+	"\033[38;5;13m",
 }
 
 func randomColor() string {
@@ -94,7 +96,7 @@ func (h *TermHandler) Handle(ctx context.Context, rec slog.Record) error {
 	}
 
 	h.mu.Lock()
-	h.mu.Unlock()
+	defer h.mu.Unlock()
 
 	_, err := h.out.Write(buf[0:l])
 	return err
