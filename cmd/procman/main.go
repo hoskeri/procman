@@ -13,11 +13,26 @@ import (
 	"github.com/hoskeri/procman/pkg/termhandler"
 )
 
+type procFlags struct {
+	Procfile  string
+	Dotenv    string
+	Formation string
+	Output    string
+	Workdir   string
+}
+
+func (p *procFlags) AddFlags(fs *flag.FlagSet) {
+	fs.StringVar(&p.Procfile, "procfile", "Procfile", "path to Procfile")
+	fs.StringVar(&p.Workdir, "workdir", "", "path to initial working dir, defaults to location of Procfile")
+	fs.StringVar(&p.Dotenv, "env", "", "path to dotenv style env file")
+	fs.StringVar(&p.Formation, "formation", "", "optional map of process type=replica-count")
+	fs.StringVar(&p.Output, "output", "auto", "output mode: auto,term,journal,syslog")
+}
+
 func main() {
-	var procfile string
-	var dotenv string
-	flag.StringVar(&procfile, "procfile", "Procfile", "path to Procfile")
-	flag.StringVar(&dotenv, "env", "", "path to dotenv style env file")
+	p := &procFlags{}
+	p.AddFlags(flag.CommandLine)
+
 	flag.Parse()
 
 	proclogger := slog.New(termhandler.New(os.Stdout, &termhandler.Options{

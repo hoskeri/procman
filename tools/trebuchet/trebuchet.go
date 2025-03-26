@@ -26,7 +26,7 @@ func main() {
 		slog.Info("trebuchet", "blocked", blocked.String(), "buf", base64.URLEncoding.EncodeToString(buf))
 		time.Sleep(10 * time.Millisecond)
 		blocked = time.Now().Sub(begin)
-		if blocked.Microseconds() > 50000 {
+		if blocked.Microseconds() > 15000 {
 			fmt.Printf("blocked for %s\n", blocked.String())
 			os.Exit(1)
 		}
