@@ -130,6 +130,7 @@ func (l *Formation) Run(ctx context.Context) error {
 			err := p.run(ctx, WithLogger(l.Sink))
 			if err != nil {
 				logger.Info(fmt.Sprintf("%s\n", err.Error()))
+				return err
 			}
 			return errors.New("unexpected nil error from p.run")
 		})
