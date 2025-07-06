@@ -1,0 +1,2 @@
+web: ../tools/trebuchet/trebuchet -count=10 -exit-code 1
+work: ../tools/trebuchet/trebuchet -count=100

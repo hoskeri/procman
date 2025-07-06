@@ -23,7 +23,7 @@ func TestProcess(t *testing.T) {
 	}
 
 	err := p.run(context.Background(), WithLogger(lg))
-	if err != nil {
+	if err != nil && !strings.Contains(err.Error(), "successfully") {
 		t.Fatalf("error: %v", err)
 	}
 }

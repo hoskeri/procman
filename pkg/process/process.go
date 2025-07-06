@@ -128,8 +128,10 @@ func (l *Formation) Run(ctx context.Context) error {
 			logger := l.Sink.WithGroup("procman")
 			logger.Info(fmt.Sprintf("%s starting\n", p.Tag))
 			err := p.run(ctx, WithLogger(l.Sink))
-			logger.Info(fmt.Sprintf("%s exited\n", p.Tag))
-			return err
+			if err != nil {
+				logger.Info(fmt.Sprintf("%s\n", err.Error()))
+			}
+			return errors.New("unexpected nil error from p.run")
 		})
 	}
 
@@ -196,6 +198,27 @@ func (p *Process) run(ctx context.Context, opt ...Option) error {
 	slog.Debug("c.run", "c.args", p.CmdArgs)
 	err := c.Run()
 	slog.Debug("c.exit", "err", err)
+	return pf(p.Tag, err)
+}
+
+func pf(tag string, err error) error {
+	switch err.(type) {
+	case *exec.ExitError:
+		ee := err.(*exec.ExitError)
+		if ee.ExitCode() == -1 {
+			ws, ok := ee.ProcessState.Sys().(syscall.WaitStatus)
+			if !ok {
+				return fmt.Errorf("%s killed", tag)
+			}
+
+			return fmt.Errorf("%s signalled, %s", tag, ws.Signal().String())
+		} else {
+			return fmt.Errorf("%s exited, exit code %d", tag, ee.ExitCode())
+		}
+	case nil:
+		return fmt.Errorf("%s exited successfully", tag)
+	}
+
 	return err
 }
 
