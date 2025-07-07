@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/hoskeri/procman/pkg/process"
 	"github.com/hoskeri/procman/pkg/termhandler"
+	"github.com/spf13/pflag"
 )
 
 type procFlags struct {
@@ -22,10 +22,10 @@ type procFlags struct {
 	Debug     bool
 }
 
-func (p *procFlags) AddFlags(fs *flag.FlagSet) {
-	fs.StringVar(&p.Procfile, "procfile", "Procfile", "path to Procfile")
-	fs.StringVar(&p.Workdir, "workdir", "", "path to initial working dir, defaults to location of Procfile")
-	fs.StringVar(&p.Dotenv, "env", "", "path to dotenv style env file")
+func (p *procFlags) AddFlags(fs *pflag.FlagSet) {
+	fs.StringVarP(&p.Procfile, "procfile", "f", "Procfile", "path to Procfile")
+	fs.StringVarP(&p.Workdir, "workdir", "w", "", "path to initial working dir, defaults to location of Procfile")
+	fs.StringVarP(&p.Dotenv, "env", "e", "", "path to dotenv style env file")
 	fs.StringVar(&p.Formation, "formation", "", "optional map of process type=replica-count")
 	fs.StringVar(&p.Output, "output", "auto", "output mode: auto,term")
 	fs.BoolVar(&p.Debug, "debug", false, "enable debug logging")
@@ -33,8 +33,9 @@ func (p *procFlags) AddFlags(fs *flag.FlagSet) {
 
 func main() {
 	p := &procFlags{}
-	p.AddFlags(flag.CommandLine)
-	flag.Parse()
+	p.AddFlags(pflag.CommandLine)
+	pflag.CommandLine.SortFlags = true
+	pflag.Parse()
 
 	ll := slog.LevelInfo
 	if p.Debug {
