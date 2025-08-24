@@ -21,7 +21,7 @@ import (
 	"github.com/hoskeri/procman/pkg/writelog"
 )
 
-// Process represents a running process
+// Process represents proc type.
 type Process struct {
 	// Short Tag representing the type of process.
 	Tag string
@@ -35,6 +35,7 @@ type Process struct {
 	Workdir string
 }
 
+// Formation is the set of process from a procfile.
 type Formation struct {
 	Workdir   string
 	Processes []*Process
@@ -108,7 +109,6 @@ func (l *Formation) Load(src io.Reader) error {
 		ps = append(ps, &Process{
 			Tag:     name,
 			CmdArgs: cmdArgs,
-			Environ: baseEnv(),
 			Workdir: l.Workdir,
 		})
 	}
@@ -151,7 +151,7 @@ func (ro *runOptions) Apply(os ...Option) {
 	}
 }
 
-func baseEnv() (ret []string) {
+func baseEnv(e ...string) (ret []string) {
 	for _, e := range []string{
 		"PATH",
 		"HOME",
@@ -160,10 +160,16 @@ func baseEnv() (ret []string) {
 		"SHELL",
 		"TERM",
 		"LANG",
+		"HTTP_PROXY",
+		"HTTPS_PROXY",
+		"NO_PROXY",
 	} {
-		ret = append(ret, e+"="+os.Getenv(e))
+		v := os.Getenv(e)
+		if v != "" {
+			ret = append(ret, e+"="+v)
+		}
 	}
-	return ret
+	return append(ret, e...)
 }
 
 type Option func(o *runOptions)
@@ -187,10 +193,7 @@ func (p *Process) run(ctx context.Context, opt ...Option) error {
 	c.Stdout = writelog.Stream(o.logger, p.Tag)
 	c.Stderr = writelog.Stream(o.logger, p.Tag)
 	c.WaitDelay = 10 * time.Second
-	c.Env = baseEnv()
-	if len(p.Environ) > 0 {
-		c.Env = p.Environ
-	}
+	c.Env = baseEnv(p.Environ...)
 	c.Dir = p.Workdir
 	c.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
