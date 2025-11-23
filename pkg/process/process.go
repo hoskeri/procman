@@ -21,7 +21,7 @@ import (
 	"github.com/hoskeri/procman/pkg/writelog"
 )
 
-// Process represents proc type.
+// Process represents is single running process.
 type Process struct {
 	// Short Tag representing the type of process.
 	Tag string
@@ -33,6 +33,8 @@ type Process struct {
 	CmdArgs []string
 	// Working directory
 	Workdir string
+	// LogLevel overrides the default log level for a process.
+	LogLevel slog.Level
 }
 
 // Formation is the set of process from a procfile.
@@ -126,10 +128,10 @@ func (l *Formation) Run(ctx context.Context) error {
 	for _, p := range l.Processes {
 		eg.Go(func() error {
 			logger := l.Sink.WithGroup("procman")
-			logger.Info(fmt.Sprintf("%s starting\n", p.Tag))
-			err := p.run(ctx, WithLogger(l.Sink))
+			logger.Warn(fmt.Sprintf("%s starting\n", p.Tag))
+			err := p.run(ctx, withLogger(l.Sink))
 			if err != nil {
-				logger.Info(fmt.Sprintf("%s\n", err.Error()))
+				logger.Warn(fmt.Sprintf("%s\n", err.Error()))
 				return err
 			}
 			return errors.New("unexpected nil error from p.run")
@@ -145,7 +147,7 @@ type runOptions struct {
 	logger *slog.Logger
 }
 
-func (ro *runOptions) Apply(os ...Option) {
+func (ro *runOptions) Apply(os ...runOption) {
 	for _, o := range os {
 		o(ro)
 	}
@@ -172,15 +174,15 @@ func baseEnv(e ...string) (ret []string) {
 	return append(ret, e...)
 }
 
-type Option func(o *runOptions)
+type runOption func(o *runOptions)
 
-func WithLogger(l *slog.Logger) Option {
+func withLogger(l *slog.Logger) runOption {
 	return func(o *runOptions) {
 		o.logger = l
 	}
 }
 
-func (p *Process) run(ctx context.Context, opt ...Option) error {
+func (p *Process) run(ctx context.Context, opt ...runOption) error {
 	o := &runOptions{
 		logger: slog.Default(),
 	}
@@ -190,8 +192,8 @@ func (p *Process) run(ctx context.Context, opt ...Option) error {
 	slog.Debug("workdir", "dir", wd)
 
 	c := exec.CommandContext(ctx, p.CmdArgs[0], p.CmdArgs[1:]...)
-	c.Stdout = writelog.Stream(o.logger, p.Tag)
-	c.Stderr = writelog.Stream(o.logger, p.Tag)
+	c.Stdout = writelog.Stream(o.logger, p.Tag, p.LogLevel)
+	c.Stderr = writelog.Stream(o.logger, p.Tag, p.LogLevel)
 	c.WaitDelay = 10 * time.Second
 	c.Env = baseEnv(p.Environ...)
 	c.Dir = p.Workdir
@@ -226,7 +228,7 @@ func pf(tag string, err error) error {
 	return err
 }
 
-func (p *Process) Exec(ctx context.Context, opt ...Option) error {
+func (p *Process) Exec(ctx context.Context, opt ...runOption) error {
 	slog.Debug("p.exec", "args", p.CmdArgs)
 	e, err := exec.LookPath(p.CmdArgs[0])
 	if err != nil {

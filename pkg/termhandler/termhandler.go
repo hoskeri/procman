@@ -47,12 +47,13 @@ type Options struct {
 }
 
 type TermHandler struct {
-	opts  Options
-	group string
-	color string
-	attrs []slog.Attr
-	mu    *sync.Mutex
-	out   io.Writer
+	opts       Options
+	group      string
+	color      string
+	linePrefix string
+	attrs      []slog.Attr
+	mu         *sync.Mutex
+	out        io.Writer
 }
 
 var _ slog.Handler = &TermHandler{}
@@ -82,14 +83,14 @@ func (h *TermHandler) Enabled(ctx context.Context, l slog.Level) bool {
 }
 
 func (h *TermHandler) Handle(ctx context.Context, rec slog.Record) error {
-	if len(h.group) == 0 {
+	if h.group == "" {
 		return nil
 	}
 
-	// can't possible be efficient.
-	buf := []byte(ansiBold + h.color + h.group + ansiReset + rec.Message)
-	l := len(buf)
+	// Can't possibly be efficient.
+	buf := []byte(h.linePrefix + rec.Message)
 
+	l := len(buf)
 	if h.opts.Columns > 0 {
 		if l > h.opts.Columns {
 			l = h.opts.Columns
@@ -117,5 +118,6 @@ func (h *TermHandler) WithGroup(name string) slog.Handler {
 	if h2.opts.Colors {
 		h2.color = randomColor(h2.group)
 	}
+	h2.linePrefix = string(ansiBold + h2.color + h2.group + ansiReset)
 	return &h2
 }
