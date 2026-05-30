@@ -26,10 +26,10 @@ func main() {
 
 		begin := time.Now()
 		ll := src.Intn(12) + rand.Intn(128) + rand.Intn(128)
-		buf := make([]byte, ll, ll)
+		buf := make([]byte, ll)
 		_, _ = src.Read(buf)
 		slog.Info("trebuchet", "blocked", blocked.String(), "s", s, "buf", base64.URLEncoding.EncodeToString(buf))
-		blocked = time.Now().Sub(begin)
+		blocked = time.Since(begin)
 		if blocked.Microseconds() > maxBlockDuration.Microseconds() {
 			fmt.Printf("blocked for %s\n", blocked.String())
 			os.Exit(1)

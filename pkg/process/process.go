@@ -21,7 +21,7 @@ import (
 	"github.com/hoskeri/procman/pkg/writelog"
 )
 
-// Process represents is single running process.
+// Process represents a single running process.
 type Process struct {
 	// Short Tag representing the type of process.
 	Tag string
@@ -68,25 +68,20 @@ func (l *Formation) LoadFile(fpath string) error {
 	l.Workdir, _ = filepath.Abs(path.Dir(fpath))
 
 	if l.Workdir != "" {
-		slog.Debug("switching to workdir", "workdir", l.Workdir)
-		if err := os.Chdir(l.Workdir); err != nil {
-			return err
-		}
+		slog.Debug("using workdir", "workdir", l.Workdir)
 	}
 
 	return l.Load(src)
 }
 
-func (l *Formation) Load(src io.Reader) error {
+func (l *Formation) Load(src io.ReadCloser) error {
+	defer src.Close()
 	ps := []*Process{}
 	lineNum := 0
 
 	sc := bufio.NewScanner(src)
 	for sc.Scan() {
 		lineNum += 1
-		if err := sc.Err(); err != nil {
-			return err
-		}
 
 		line := sc.Text()
 
@@ -114,6 +109,9 @@ func (l *Formation) Load(src io.Reader) error {
 			Workdir: l.Workdir,
 		})
 	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
 
 	l.Processes = ps
 	return nil
@@ -124,23 +122,20 @@ func (l *Formation) Run(ctx context.Context) error {
 	defer cancel()
 
 	eg, ctx := errgroup.WithContext(ctx)
-
 	for _, p := range l.Processes {
+		// copying loop var not needed.
 		eg.Go(func() error {
 			logger := l.Sink.WithGroup("procman")
-			logger.Warn(fmt.Sprintf("%s starting\n", p.Tag))
+			logger.Warn("starting", "process", p.Tag)
 			err := p.run(ctx, withLogger(l.Sink))
 			if err != nil {
-				logger.Warn(fmt.Sprintf("%s\n", err.Error()))
-				return err
+				logger.Warn("exited", "process", p.Tag, "err", err)
 			}
-			return errors.New("unexpected nil error from p.run")
+			return err
 		})
 	}
 
-	egErr := eg.Wait()
-	<-ctx.Done()
-	return egErr
+	return eg.Wait()
 }
 
 type runOptions struct {
@@ -188,15 +183,19 @@ func (p *Process) run(ctx context.Context, opt ...runOption) error {
 	}
 	o.Apply(opt...)
 
-	wd, _ := os.Getwd()
-	slog.Debug("workdir", "dir", wd)
-
 	c := exec.CommandContext(ctx, p.CmdArgs[0], p.CmdArgs[1:]...)
-	c.Stdout = writelog.Stream(o.logger, p.Tag, p.LogLevel)
-	c.Stderr = writelog.Stream(o.logger, p.Tag, p.LogLevel)
+	stdout := writelog.Stream(o.logger, p.Tag, p.LogLevel)
+	stderr := writelog.Stream(o.logger, p.Tag, p.LogLevel)
+	defer stdout.Close()
+	defer stderr.Close()
+	c.Stdout = stdout
+	c.Stderr = stderr
 	c.WaitDelay = 10 * time.Second
 	c.Env = baseEnv(p.Environ...)
 	c.Dir = p.Workdir
+	c.Cancel = func() error {
+		return syscall.Kill(-c.Process.Pid, syscall.SIGTERM)
+	}
 	c.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
@@ -208,21 +207,19 @@ func (p *Process) run(ctx context.Context, opt ...runOption) error {
 }
 
 func pf(tag string, err error) error {
-	switch err.(type) {
+	switch ee := err.(type) {
 	case *exec.ExitError:
-		ee := err.(*exec.ExitError)
 		if ee.ExitCode() == -1 {
 			ws, ok := ee.ProcessState.Sys().(syscall.WaitStatus)
 			if !ok {
 				return fmt.Errorf("%s killed", tag)
 			}
-
 			return fmt.Errorf("%s signalled, %s", tag, ws.Signal().String())
-		} else {
-			return fmt.Errorf("%s exited, exit code %d", tag, ee.ExitCode())
 		}
+		return fmt.Errorf("%s exited, exit code %d", tag, ee.ExitCode())
 	case nil:
-		return fmt.Errorf("%s exited successfully", tag)
+		// Clean exit — not an error.
+		return nil
 	}
 
 	return err

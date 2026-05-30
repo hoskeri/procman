@@ -79,16 +79,19 @@ func New(out *os.File, opts *Options) *TermHandler {
 }
 
 func (h *TermHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	if h.group == "" {
+		return false
+	}
 	return l >= h.opts.Level.Level()
 }
 
 func (h *TermHandler) Handle(ctx context.Context, rec slog.Record) error {
-	if h.group == "" {
-		return nil
-	}
-
 	// Can't possibly be efficient.
 	buf := []byte(h.linePrefix + rec.Message)
+
+	if len(buf) == 0 {
+		return nil
+	}
 
 	l := len(buf)
 	if h.opts.Columns > 0 {
@@ -109,14 +112,16 @@ func (h *TermHandler) Handle(ctx context.Context, rec slog.Record) error {
 }
 
 func (h *TermHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return h
+	h2 := *h
+	h2.attrs = append(h2.attrs, attrs...)
+	return &h2
 }
 
 func (h *TermHandler) WithGroup(name string) slog.Handler {
 	h2 := *h
 	h2.group = fmt.Sprintf("%16s | ", name)
 	if h2.opts.Colors {
-		h2.color = randomColor(h2.group)
+		h2.color = randomColor(name)
 	}
 	h2.linePrefix = string(ansiBold + h2.color + h2.group + ansiReset)
 	return &h2

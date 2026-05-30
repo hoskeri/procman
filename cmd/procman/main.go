@@ -42,7 +42,6 @@ func main() {
 		ll = slog.LevelDebug
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{AddSource: false, Level: ll})))
-
 	proclogger := slog.New(termhandler.New(os.Stdout, &termhandler.Options{
 		Level: slog.LevelDebug,
 	}))
@@ -58,7 +57,7 @@ func main() {
 	}
 
 	if err := fm.LoadFile(p.Procfile); err != nil {
-		slog.Debug("fm.LoadFile", "err", err)
+		slog.Error("fm.LoadFile", "err", err)
 		os.Exit(1)
 	}
 
@@ -67,7 +66,7 @@ func main() {
 	defer stop()
 
 	if err := fm.Run(ctx); err != nil {
-		slog.Debug("fm.Run", "err", err)
+		slog.Error("fm.Run", "err", err)
 		os.Exit(1)
 	}
 }
