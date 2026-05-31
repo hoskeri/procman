@@ -86,6 +86,10 @@ func (h *TermHandler) Enabled(ctx context.Context, l slog.Level) bool {
 }
 
 func (h *TermHandler) Handle(ctx context.Context, rec slog.Record) error {
+	if rec.Message == "" {
+		return nil
+	}
+
 	// Can't possibly be efficient.
 	buf := []byte(h.linePrefix + rec.Message)
 
@@ -101,13 +105,13 @@ func (h *TermHandler) Handle(ctx context.Context, rec slog.Record) error {
 	}
 
 	if buf[l-1] != '\n' {
-		buf[l-1] = '\n'
+		buf = append(buf, '\n')
 	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	_, err := h.out.Write(buf[0:l])
+	_, err := h.out.Write(buf)
 	return err
 }
 

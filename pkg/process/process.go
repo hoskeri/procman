@@ -126,10 +126,10 @@ func (l *Formation) Run(ctx context.Context) error {
 		// copying loop var not needed.
 		eg.Go(func() error {
 			logger := l.Sink.WithGroup("procman")
-			logger.Warn("starting", "process", p.Tag)
+			logger.Warn(fmt.Sprintf("starting %s", p.Tag))
 			err := p.run(ctx, withLogger(l.Sink))
 			if err != nil {
-				logger.Warn("exited", "process", p.Tag, "err", err)
+				logger.Warn(err.Error())
 			}
 			return err
 		})
@@ -188,13 +188,14 @@ func (p *Process) run(ctx context.Context, opt ...runOption) error {
 	stderr := writelog.Stream(o.logger, p.Tag, p.LogLevel)
 	defer stdout.Close()
 	defer stderr.Close()
+	c.Stdin = nil
 	c.Stdout = stdout
 	c.Stderr = stderr
-	c.WaitDelay = 10 * time.Second
+	c.WaitDelay = 1 * time.Second
 	c.Env = baseEnv(p.Environ...)
 	c.Dir = p.Workdir
 	c.Cancel = func() error {
-		return syscall.Kill(-c.Process.Pid, syscall.SIGTERM)
+		return syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
 	}
 	c.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
@@ -218,8 +219,9 @@ func pf(tag string, err error) error {
 		}
 		return fmt.Errorf("%s exited, exit code %d", tag, ee.ExitCode())
 	case nil:
-		// Clean exit — not an error.
-		return nil
+		// we return an error here so that any process exiting
+		// also causes the other processes to stop too.
+		return fmt.Errorf("%s exited", tag)
 	}
 
 	return err
