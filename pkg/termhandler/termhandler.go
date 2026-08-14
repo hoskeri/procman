@@ -49,6 +49,8 @@ type Options struct {
 type TermHandler struct {
 	opts       Options
 	group      string
+	name       string
+	override   slog.Leveler
 	color      string
 	linePrefix string
 	attrs      []slog.Attr
@@ -78,11 +80,29 @@ func New(out *os.File, opts *Options) *TermHandler {
 	return h
 }
 
+// WithOverride returns a handler for the given group whose minimum log level
+// is lvl, overriding the inherited Options.Level for that group only. The
+// original level is preserved, so sub-groups still inherit it unless they too
+// are overridden.
+func (h *TermHandler) WithOverride(name string, lvl slog.Leveler) slog.Handler {
+	h2 := h.groupHandler(name)
+	h2.override = lvl
+	return h2
+}
+
 func (h *TermHandler) Enabled(ctx context.Context, l slog.Level) bool {
-	if h.group == "" {
+	if h.name == "" {
 		return false
 	}
-	return l >= h.opts.Level.Level()
+
+	// opts.Level is the inherited original level; override, when set, is the
+	// per-process threshold. Both are plain immutable fields on this handler,
+	// so no locking is needed here.
+	threshold := h.opts.Level
+	if h.override != nil {
+		threshold = h.override
+	}
+	return l >= threshold.Level()
 }
 
 func (h *TermHandler) Handle(ctx context.Context, rec slog.Record) error {
@@ -121,12 +141,17 @@ func (h *TermHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &h2
 }
 
-func (h *TermHandler) WithGroup(name string) slog.Handler {
+func (h *TermHandler) groupHandler(name string) *TermHandler {
 	h2 := *h
+	h2.name = name
 	h2.group = fmt.Sprintf("%16s | ", name)
 	if h2.opts.Colors {
 		h2.color = randomColor(name)
 	}
 	h2.linePrefix = string(ansiBold + h2.color + h2.group + ansiReset)
 	return &h2
+}
+
+func (h *TermHandler) WithGroup(name string) slog.Handler {
+	return h.groupHandler(name)
 }

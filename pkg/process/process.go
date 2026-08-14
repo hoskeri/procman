@@ -117,17 +117,35 @@ func (l *Formation) Load(src io.ReadCloser) error {
 	return nil
 }
 
+// levelSetter is implemented by slog.Handlers that can produce per-group
+// handlers with an overridden minimum log level (e.g. termhandler.TermHandler).
+// It is matched structurally to avoid a hard package dependency.
+type levelSetter interface {
+	WithOverride(name string, lvl slog.Leveler) slog.Handler
+}
+
 func (l *Formation) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	eg, ctx := errgroup.WithContext(ctx)
 	for _, p := range l.Processes {
-		// copying loop var not needed.
+		// Give each process its own logger. When the sink's handler supports
+		// per-group overrides and the process carries a non-zero LogLevel,
+		// filter this process's output at that level; otherwise the process
+		// inherits the handler's global level. A zero-value LogLevel
+		// (slog.LevelInfo) means "no override".
+		procLogger := l.Sink
+		if p.LogLevel != 0 {
+			if ls, ok := l.Sink.Handler().(levelSetter); ok {
+				procLogger = slog.New(ls.WithOverride(p.Tag, p.LogLevel))
+			}
+		}
+
 		eg.Go(func() error {
 			logger := l.Sink.WithGroup("procman")
 			logger.Warn(fmt.Sprintf("starting %s", p.Tag))
-			err := p.run(ctx, withLogger(l.Sink))
+			err := p.run(ctx, withLogger(procLogger))
 			if err != nil {
 				logger.Warn(err.Error())
 			}
@@ -184,8 +202,11 @@ func (p *Process) run(ctx context.Context, opt ...runOption) error {
 	o.Apply(opt...)
 
 	c := exec.CommandContext(ctx, p.CmdArgs[0], p.CmdArgs[1:]...)
-	stdout := writelog.Stream(o.logger, p.Tag, p.LogLevel)
-	stderr := writelog.Stream(o.logger, p.Tag, p.LogLevel)
+	// Process output is logged at a fixed base level; Process.LogLevel only
+	// adjusts the per-group minimum threshold (see Formation.Run), so the two
+	// never cancel each other out.
+	stdout := writelog.Stream(o.logger, p.Tag, slog.LevelInfo)
+	stderr := writelog.Stream(o.logger, p.Tag, slog.LevelInfo)
 	defer stdout.Close()
 	defer stderr.Close()
 	c.Stdin = nil

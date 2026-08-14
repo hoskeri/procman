@@ -10,6 +10,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+
+	"github.com/hoskeri/procman/pkg/termhandler"
 )
 
 func TestProcess(t *testing.T) {
@@ -25,8 +27,51 @@ func TestProcess(t *testing.T) {
 	}
 
 	err := p.run(context.Background(), withLogger(lg))
+	if err == nil {
+		t.Fatal("expected non-nil error on clean exit: any process exit cancels the formation")
+	}
+	if !strings.Contains(err.Error(), "hello exited") {
+		t.Fatalf("expected clean-exit error, got: %v", err)
+	}
+}
+
+// TestPerProcessLogLevelOverride runs two real processes through Formation.Run
+// and verifies that a per-process LogLevel override suppresses that process's
+// output while other processes keep the global level.
+func TestPerProcessLogLevelOverride(t *testing.T) {
+	logFile, err := os.CreateTemp(t.TempDir(), "procman-loglevel-*.log")
 	if err != nil {
-		t.Fatalf("expected nil error for clean exit, got: %v", err)
+		t.Fatalf("create temp log file: %v", err)
+	}
+	defer logFile.Close()
+
+	th := termhandler.New(logFile, &termhandler.Options{Level: slog.LevelInfo})
+	lg := slog.New(th)
+
+	frm := &Formation{
+		Sink: lg,
+		Processes: []*Process{
+			{Tag: "web", CmdArgs: []string{"/bin/sh", "-c", "echo web-message"}},
+			{Tag: "quiet", CmdArgs: []string{"/bin/sh", "-c", "echo quiet-message"}, LogLevel: slog.LevelError},
+		},
+	}
+
+	// Processes exit cleanly, so Formation.Run returns a non-nil error by
+	// design (any process exit cancels the group); the output is what matters.
+	_ = frm.Run(context.Background())
+
+	data, err := os.ReadFile(logFile.Name())
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+	out := string(data)
+	t.Logf("process output:\n%s", out)
+
+	if !strings.Contains(out, "web-message") {
+		t.Errorf("expected web output to be logged at the global Info level, got:\n%s", out)
+	}
+	if strings.Contains(out, "quiet-message") {
+		t.Errorf("expected quiet output to be suppressed by its per-process Error override, got:\n%s", out)
 	}
 }
 
