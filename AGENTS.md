@@ -18,9 +18,12 @@ minimal, embeddable alternative to tools like [Foreman][foreman].
 │   └── procman/              # Command-line entry point
 │       └── main.go           # CLI flags parsing, setup, and orchestration
 ├── pkg/
-│   ├── process/              # Core process representation, parsing, and execution
+│   ├── procfile/             # Procfile parsing
+│   │   ├── procfile.go       # Parses Procfile text into Tag/command records
+│   │   └── procfile_test.go  # Unit tests for parsing
+│   ├── process/              # Core process representation and execution
 │   │   ├── process.go        # Spawns & monitors processes under errgroup.Group
-│   │   └── process_test.go   # Unit tests for parsing and execution
+│   │   └── process_test.go   # Unit tests for execution and formation wiring
 │   ├── termhandler/          # slog.Handler for colorful process-specific prefixes
 │   │   └── termhandler.go    # Prepends bold, colored tags to log lines
 │   └── writelog/             # io.Writer adapter to capture and pipe streams to slog
@@ -39,7 +42,7 @@ minimal, embeddable alternative to tools like [Foreman][foreman].
 
 ## 3. Core Architecture & Components
 
-`procman` is built on three core packages inside `pkg/` that collaborate to
+`procman` is built on four core packages inside `pkg/` that collaborate to
 parse, execute, and stream output from processes:
 
 ### A. Concurrency & Execution (`pkg/process`)
@@ -51,12 +54,10 @@ parse, execute, and stream output from processes:
   - Can execute processes using standard `os/exec` under a specific context
     (`run`), or replace the existing process using `syscall.Exec` (`Exec`).
 
-  - **`Formation`**: Represents the collection of processes parsed from a
-    `Procfile`.    - Parses Procfiles using `LoadFile` or `Load`. Lines
-    starting with `#` are ignored, and each line is split by `:` into `Tag` and
-    `Command` segments.
-    - Uses `github.com/mattn/go-shellwords` to parse command-line strings into
-      argument slices correctly respecting quotes.
+  - **`Formation`**: Represents the collection of processes from a `Procfile`.
+    `LoadFile` (or `New`) resolves the working directory and delegates parsing
+    to **`pkg/procfile`**; `Load` converts the parsed records into `Process`
+    structs wired to the formation's `Workdir`.
     - Orchestrates execution inside `Run(ctx)`. Processes are started in
       parallel using an **`golang.org/x/sync/errgroup.Group`**.
     - **Crucial Behavior:** Under the `errgroup`, if any single process exits
@@ -65,7 +66,18 @@ parse, execute, and stream output from processes:
       This matches Heroku/Foreman behavior.
 
 
-### B. Output Stream Redirection (`pkg/writelog`)
+### B. Procfile Parsing (`pkg/procfile`)
+
+- **`Parse`** (defined in `pkg/procfile/procfile.go`): Parses Procfile text
+  into a list of `Record`s (a `Tag` and shellwords-parsed `CmdArgs`).
+    - Lines starting with `#` and blank lines are ignored; each remaining line
+      is split at the first `:` into `Tag` and `Command` segments.
+    - Uses `github.com/mattn/go-shellwords` to parse command-line strings into
+      argument slices correctly respecting quotes.
+    - Returns a neutral record type — the package does not depend on
+      `pkg/process`. Malformed lines (no `:`) report the offending line number.
+
+### C. Output Stream Redirection (`pkg/writelog`)
 
 - **`stream`** (defined in `pkg/writelog/writelog.go`): Implements `io.Writer`.
     - Captures raw `stdout` and `stderr` from the running subprocesses.
@@ -77,7 +89,7 @@ parse, execute, and stream output from processes:
       attribute (`tag="web"`), guaranteeing proper tracing.
 
 
-### C. Aesthetic Terminal Logging (`pkg/termhandler`)
+### D. Aesthetic Terminal Logging (`pkg/termhandler`)
 
 - **`TermHandler`** (defined in `pkg/termhandler/termhandler.go`): Implements
   `slog.Handler` on top of a standard file/writer output.
@@ -138,9 +150,11 @@ Deletes compiled binaries (`procman` and `trebuchet`).
 
 ## 7. Development Tips & Gotchas for Agents
 
-- **Test Formation**: `TestFormation` in `pkg/process/process\_test.go` has two
-    subtests covering quoted arguments and comment/blank-line skipping. If you
-    modify Procfile parsing, extend these cases.
+- **Procfile Parsing**: The parser lives in `pkg/procfile`; `TestParse` there
+    covers quoted arguments, comment/blank-line skipping, and malformed lines.
+    `TestFormation` in `pkg/process/process_test.go` covers conversion of parsed
+    records into `Process` structs wired to the workdir. If you modify Procfile
+    parsing, extend `pkg/procfile/procfile_test.go`.
   - **Context Cleanup**: Ensure that any manual signal handling or parent context
     propagation preserves the cancel propagation. When processes exit, their
     processes should be reaped cleanly by the OS. The `c.WaitDelay` is set to

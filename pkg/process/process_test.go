@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
 
 	"github.com/hoskeri/procman/pkg/termhandler"
 )
@@ -75,40 +74,23 @@ func TestPerProcessLogLevelOverride(t *testing.T) {
 	}
 }
 
+// TestFormation verifies that Formation.Load converts parsed records into
+// Processes wired to the formation's Workdir. Procfile parsing itself is
+// covered by pkg/procfile/procfile_test.go.
 func TestFormation(t *testing.T) {
-	testCases := []struct {
-		name string
-		data string
-		want []*Process
-		err  error
-	}{
-		{
-			name: "basic quoted args",
-			data: "web: ./webserver \"hello world\"\ndb: ./mysql 'a b c'",
-			want: []*Process{
-				{Tag: "web", CmdArgs: []string{"./webserver", "hello world"}},
-				{Tag: "db", CmdArgs: []string{"./mysql", "a b c"}},
-			},
-		},
-		{
-			name: "comment and blank lines are skipped",
-			data: "# this is a comment\n\nweb: ./server",
-			want: []*Process{
-				{Tag: "web", CmdArgs: []string{"./server"}},
-			},
-		},
+	frm := &Formation{
+		Workdir: "/srv/app",
+	}
+	err := frm.Load(io.NopCloser(strings.NewReader("web: ./webserver \"hello world\"\ndb: ./mysql 'a b c'")))
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			frm := &Formation{}
-			err := frm.Load(io.NopCloser(strings.NewReader(tc.data)))
-			if err != nil {
-				t.Fatalf("Load() error: %v", err)
-			}
-			if diff := cmp.Diff(tc.want, frm.Processes, cmpopts.IgnoreFields(Process{}, "Workdir")); diff != "" {
-				t.Fatalf("unexpected processes (-want, +got):\n%s", diff)
-			}
-		})
+	want := []*Process{
+		{Tag: "web", CmdArgs: []string{"./webserver", "hello world"}, Workdir: "/srv/app"},
+		{Tag: "db", CmdArgs: []string{"./mysql", "a b c"}, Workdir: "/srv/app"},
+	}
+	if diff := cmp.Diff(want, frm.Processes); diff != "" {
+		t.Fatalf("unexpected processes (-want, +got):\n%s", diff)
 	}
 }

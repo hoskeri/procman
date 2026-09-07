@@ -1,9 +1,7 @@
 package process
 
 import (
-	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,13 +9,12 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
-	"github.com/mattn/go-shellwords"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/hoskeri/procman/pkg/procfile"
 	"github.com/hoskeri/procman/pkg/writelog"
 )
 
@@ -75,42 +72,18 @@ func (l *Formation) LoadFile(fpath string) error {
 }
 
 func (l *Formation) Load(src io.ReadCloser) error {
-	defer src.Close()
+	records, err := procfile.Parse(src)
+	if err != nil {
+		return err
+	}
+
 	ps := []*Process{}
-	lineNum := 0
-
-	sc := bufio.NewScanner(src)
-	for sc.Scan() {
-		lineNum += 1
-
-		line := sc.Text()
-
-		if len(line) == 0 {
-			continue
-		}
-
-		if strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		name, cmd, found := strings.Cut(line, ":")
-		if !found {
-			return errors.New("invalid line")
-		}
-
-		cmdArgs, err := shellwords.Parse(cmd)
-		if err != nil {
-			return err
-		}
-
+	for _, r := range records {
 		ps = append(ps, &Process{
-			Tag:     name,
-			CmdArgs: cmdArgs,
+			Tag:     r.Tag,
+			CmdArgs: r.CmdArgs,
 			Workdir: l.Workdir,
 		})
-	}
-	if err := sc.Err(); err != nil {
-		return err
 	}
 
 	l.Processes = ps
