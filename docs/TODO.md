@@ -25,7 +25,9 @@ are actually open, then refreshing the README so it describes reality.
 | Formation support (replicas per type) | **Not done** — flag is dead | `--formation` parsed in `cmd/procman/main.go:29` but never read; `Process.Index` never set (`pkg/process/process.go:26`) |
 | Port allocation | **Not done** — no code | Nothing injects `PORT` anywhere |
 | dotenv support | **Not done** — flag is dead | `--env`/`-e` parsed in `cmd/procman/main.go:28` but never read |
-| Throttle/discard slow terminal output | Half done | `tools/trebuchet` *measures* blocking; no throttle logic; `--output` flag dead (`main.go:30`) |
+| Throttle/discard slow terminal output | **Done** (2026-09-13) | Bounded async queue in `writelog` (tail-drop, default 256); `--columns`, `--output auto|term` live (queue depth is a library default, not a CLI flag — see §5); `trebuchet` E2E-verified; see `docs/THROTTLING.md` |
+
+Also dead in `main.go`: replaced by live flags in the throttle work — `Output`, `Columns` are now parsed and consumed.
 
 Also dead in `main.go`: the `Output` field — never read after parse.
 
@@ -87,25 +89,55 @@ per Procfile line. `Process.Index` exists but is never assigned.
       one test asserting child env actually receives a dotenv variable
       (`pkg/process/process_test.go`).
 
-### 4. Terminal throttle / discard on slow terminal
+### 4. Terminal throttle / discard on slow terminal — DONE (2026-09-13)
 
-**Current state:** `tools/trebuchet` measures whether logging blocks
-(`blocked` > `--max-block` aborts), but nothing throttles. `TermHandler`
-truncates lines only if `Options.Columns > 0`, and nothing sets that option.
-`--output auto|term` is parsed but ignored — the termhandler is always used.
+Implemented per `docs/THROTTLING.md` (design + implementation record).
 
-- [ ] Define the throttle policy. Options to evaluate (pick in review):
-      bounded in-memory queue in `writelog` that coalesces/decays lines when
-      the sink is slow; or drop-oldest in `TermHandler.Handle` under
-      backpressure. Keep the cancel semantics intact — a slow *output* must
-      never block process reaping.
-- [ ] Wire `--output` in `cmd/procman/main.go`: `auto` = termhandler when
-      stdout is a tty, plain text handler otherwise; `term` = force color.
-- [ ] Expose `--columns` (or similar) to set `TermHandler.Options.Columns`
-      (`pkg/termhandler/termhandler.go:121`) for line truncation.
-- [ ] Acceptance: `trebuchet` passes with `--output term`; a piped/slow sink
-      run completes without unbounded buffering; document the tradeoff in the
-      README.
+- **Policy:** bounded async queue in `pkg/writelog.Stream` (ring buffer,
+  `StreamConfig.MaxQueue`, default `DefaultMaxQueue` = 256); when full the
+  oldest line is **tail-dropped** so the child is never back-pressured. A
+  dedicated worker goroutine drains the queue to the sink; `Close()` waits for
+  the drain then flushes a final partial line.
+- **`--output auto|term`** wired in `cmd/procman/main.go`: `auto` =
+  termhandler on a tty, plain `TextHandler` when piped; `term` = force
+  termhandler (color when piped).
+- **`--columns N`** sets `TermHandler.Options.Columns`; truncation is now
+  actually applied (`Handle` previously computed the length but wrote the
+  full buffer).
+- **Queue depth is not a CLI flag.** The `--max-log-queue` flag and the
+  `Formation.LogQueueSize` → `withLogQueue` plumbing were **removed**; the
+  streams always use the `DefaultMaxQueue` (256) default, and
+  `writelog.StreamConfig.MaxQueue` remains as a library knob for embedders
+  (and deterministic tail-drop tests). See `docs/THROTTLING.md` §9.
+- **Tests:** `writelog` (drain order, tail-drop under backpressure, default
+  queue), `termhandler` (columns truncation, forced colors, `IsTerminal`).
+  E2E: trebuchet under a pty with a slow reader delivers a bounded subset,
+  production continues, no "blocked for" abort.
+- **Notes:** `TestPerProcessLogLevelOverride` made deterministic (quiet
+delays so web echoes first; two racing children were flaky).
+
+### 5. Hot-path performance: writelog + termhandler — partial (2026-09-13)
+
+Analysis + behavioral-optimization pass on the output hot path. Full record in
+`docs/THROTTLING.md` §9. Current state:
+
+- **Done:** single-copy line split (REPLACED `bytes.Buffer.ReadBytes`, which
+  copied each line twice → 2 allocs/line, with a direct `bytes.IndexByte`
+  scan → 1 alloc/line) and batched enqueue+drain (`push`/`pushAll`;
+  `drain` pops up to 32 lines per lock hold, logs outside the lock).
+  Results: −50% allocations and −25–36% time across the cheap-sink, full-
+  term-path, and 16-stream-contention benchmarks; all tests + `-race` green.
+- **Accepted invariant:** the single `TermHandler` mutex / single fd is a
+  serialization (latency) point, **not** a blocking point for child processes
+  — it is only reached through the bounded writelog queue, which tail-drops
+  when the sink is wedged, so producers never block on the lock.
+- [ ] **Deferred:** write-batching coalescer for the shared fd to cut the
+      remaining cross-stream/`write(2)` serialization cost. Larger behavior
+      change; not required for the no-process-blocking invariant.
+- [ ] **Deferred (optional):** eliminate the last per-line allocation via a
+      buffer pool with explicit lifetime tracking across the async ring
+      (needed because a zero-copy view into the `os/exec` copy buffer is
+      unsafe, and the one copy remains).
 
 ## Release readiness checklist
 
@@ -115,12 +147,15 @@ Code, tests, and docs:
       these are done" gate from the README.
 - [ ] Rewrite `README.md`: drop the "foreman instead for now" caveat and the
       implied unusability; document actual flags (`-f/--procfile`,
-      `-w/--workdir`, `-e/--env`, `--formation`, `--output`, `--debug`);
-      add a short usage example and note the embeddable-library use case next
-      to the CLI use case.
-- [ ] Fix `AGENTS.md` drift: it claims `c.WaitDelay` is `10 * time.Second`
-      (`AGENTS.md:146`) but the code sets `1 * time.Second`
-      (`pkg/process/process.go:188`). Make the doc match reality.
+      `-w/--workdir`, `-e/--env`, `--formation`, `--output`, `--columns`,
+      `--debug`); add a short usage example and note the
+      embeddable-library use case next to the CLI use case. (Progress: README
+      now has Usage + throttling sections; the caveat stays until formation/
+      port/dotenv close.)
+- [x] Fix `AGENTS.md` drift: it claimed `c.WaitDelay` is `10 * time.Second`
+      but the code sets `1 * time.Second` (`pkg/process/process.go:188`); doc
+      updated, and `writelog`/`termhandler` sections refreshed for the
+      throttle work.
 - [ ] Integration coverage for `tests/Procfile.clean` and
       `tests/Procfile.onefailed`: add a `make integration` (or extend
       `make test`) target that runs the built binary against both Procfiles

@@ -9,6 +9,40 @@ You probably want https://github.com/ddollar/foreman instead for now.
 
 [procfile]: https://devcenter.heroku.com/articles/procfile
 
+## Usage
+
+```
+procman [-f/--procfile PATH] [-w/--workdir PATH] [-e/--env PATH]
+        [--formation web=2] [--output auto|term] [--columns N] [--debug]
+```
+
+- `-f/--procfile` — path to the Procfile (default: `./Procfile`).
+- `-w/--workdir` — working directory for child processes; defaults to the
+  Procfile's directory.
+- `-e/--env` — dotenv-style env file (planned).
+- `--formation` — per-type replica counts, e.g. `web=2` (planned).
+- `--output auto|term` — `auto` (default) uses the colored, per-process
+  prefixed term handler when stdout is a terminal and a plain text handler
+  when piped; `term` forces the term handler (color even when piped).
+- `--columns N` — truncates each term-handler output line to `N` bytes
+  (default 0 = off).
+- `--debug` — debug logging on stderr.
+
+## Terminal throttling
+
+Process output is never written to the terminal synchronously on the child's
+write path. Each `stdout`/`stderr` stream feeds a bounded in-memory queue
+(`writelog.DefaultMaxQueue` = 256 lines) drained by a background worker; when
+the queue is full the oldest line is discarded. A slow terminal therefore
+back-pressures neither the child process nor its reaping: logs are elided,
+process cancellation semantics are unchanged. See `docs/THROTTLING.md`.
+
+`procman`'s own `--max-log-queue` flag was intentionally not exposed: the
+exact bound has no user-tunable sweet spot (any reasonable value keeps the
+child unblocked), so the CLI keeps the default. Embedders who need to bound
+it can pass `writelog.StreamConfig.MaxQueue` per stream (`<= 0` falls back to
+`DefaultMaxQueue`). See `docs/THROTTLING.md` §9.
+
 ## Work in Progress
 
 I wouldn't recommend using this until most of these are done.
@@ -17,7 +51,7 @@ I wouldn't recommend using this until most of these are done.
 - [ ] Formation support - set number of processes per type.
 - [ ] Port allocation
 - [ ] Support [dotenv][]
-- [ ] Throttle terminal output/discard logs if terminal is too slow.
+- [x] Throttle terminal output/discard logs if terminal is too slow.
 
 ## License
 

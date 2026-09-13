@@ -2,10 +2,13 @@ package termhandler
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // newTestHandler returns a TermHandler writing into a buffer, so tests don't
@@ -95,5 +98,60 @@ func TestOverrideSurvivesReGroup(t *testing.T) {
 	web.Info("web info")
 	if !strings.Contains(buf.String(), "web info") {
 		t.Error("expected web info to be logged at the inherited global level")
+	}
+}
+
+// TestColumnsTruncation verifies that Options.Columns truncates a log message
+// to at most Columns bytes before it reaches the output writer.
+func TestColumnsTruncation(t *testing.T) {
+	th, buf := newTestHandler(slog.LevelInfo)
+	th.opts.Columns = 8
+
+	rec := slog.NewRecord(time.Time{}, slog.LevelInfo, strings.Repeat("a", 11), 0)
+	if err := th.Handle(context.Background(), rec); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if got, want := buf.String(), "aaaaaaaa\n"; got != want {
+		t.Errorf("Columns=8 truncation: want %q, got %q", want, got)
+	}
+}
+
+// TestNewColorsForced verifies that Options.Colors=true forces color even on a
+// non-terminal (so --output term works on piped stdout), while the default
+// auto-detects (color off for a pipe).
+func TestNewColorsForced(t *testing.T) {
+	// A pipe end is not a terminal.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer r.Close()
+	defer w.Close()
+
+	if !New(w, &Options{Colors: true}).opts.Colors {
+		t.Error("Options.Colors=true should force color even when not a terminal")
+	}
+	if New(w, &Options{}).opts.Colors {
+		t.Error("non-terminal without forced color should not enable color")
+	}
+	if New(w, &Options{}).opts.Columns != 0 {
+		t.Error("Options.Columns should default to 0 (truncation off)")
+	}
+}
+
+// TestIsTerminal reports correctness of the helper used by main for --output.
+func TestIsTerminal(t *testing.T) {
+	if IsTerminal(nil) {
+		t.Error("IsTerminal(nil) should be false")
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer r.Close()
+	defer w.Close()
+	if IsTerminal(w) {
+		t.Error("IsTerminal(pipe) should be false")
 	}
 }

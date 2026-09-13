@@ -83,10 +83,19 @@ parse, execute, and stream output from processes:
     - Captures raw `stdout` and `stderr` from the running subprocesses.
     - Buffers bytes using `bytes.Buffer` and reads incoming blocks until it hits
       newline (`\n`) bytes.
-    - Each extracted line is fed directly into a structured `slog.Logger`
-      (`s.sink.LogAttrs(...)`) at a specified log level.
+    - Each complete line is enqueued onto a **bounded async queue** (default
+      depth `DefaultMaxQueue` = 256) drained by a dedicated worker goroutine
+      that feeds the line into a structured `slog.Logger` (`s.sink.LogAttrs(...)`)
+      at a specified log level. When the queue is full the **oldest line is
+      discarded** (tail policy), so a slow sink (terminal) never back-pressures
+      the child process.
+    - `Stream(sink, tag, lvl, StreamConfig)` returns an `io.WriteCloser`.
+      `StreamConfig.MaxQueue` bounds the queue (`<= 0` = default).
     - **Tagging:** Every logged line includes the process tag as a group and
       attribute (`tag="web"`), guaranteeing proper tracing.
+    - **Stream Lifecycle:** Always call `Close()` after the subprocess exits.
+      `Close` stops the drain worker after it has emitted every queued line,
+      then flushes any partial last line that lacked a trailing newline.
 
 
 ### D. Aesthetic Terminal Logging (`pkg/termhandler`)
@@ -94,7 +103,10 @@ parse, execute, and stream output from processes:
 - **`TermHandler`** (defined in `pkg/termhandler/termhandler.go`): Implements
   `slog.Handler` on top of a standard file/writer output.
     - Automatically checks if the writer is a terminal using `terminal.IsTerminal`
-      and toggles ANSI color escape codes accordingly.
+      and toggles ANSI color escape codes accordingly. `Options.Colors: true`
+      forces color even on non-terminals (`--output term`).
+    - `Options.Columns > 0` truncates each emitted line (prefix included) to
+      `Columns` bytes.
     - Hashes the process `Tag` using FNV-1a to dynamically assign a consistent,
       random, high-contrast ANSI foreground color from a pre-defined palette.
     - Prefixes every printed log message with a bold, colorful label (e.g., `web
@@ -158,7 +170,7 @@ Deletes compiled binaries (`procman` and `trebuchet`).
   - **Context Cleanup**: Ensure that any manual signal handling or parent context
     propagation preserves the cancel propagation. When processes exit, their
     processes should be reaped cleanly by the OS. The `c.WaitDelay` is set to
-    `10 * time.Second` to allow soft shutdown before hard termination.
+    `1 * time.Second` to allow soft shutdown before hard termination.
   - **Environment Setup**: The runner utilizes `baseEnv(...)` to forward critical
     environment variables (`PATH`, `HOME`, `TERM`, `HTTP\_PROXY`, etc.) from the
     host machine to child processes. When writing tests or running locally,
@@ -166,7 +178,4 @@ Deletes compiled binaries (`procman` and `trebuchet`).
   - **Log API Compatibility**: The library uses Go's standard `log/slog` library
     introduced in Go 1.21. All custom handlers and logging interfaces must
     adhere strictly to `slog.Handler`.
-  - **Stream Lifecycle**: `writelog.Stream` returns an `io.WriteCloser`. Always
-    call `Close()` after the subprocess exits to flush any partial last line
-    that lacked a trailing newline.
 

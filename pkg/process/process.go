@@ -177,9 +177,11 @@ func (p *Process) run(ctx context.Context, opt ...runOption) error {
 	c := exec.CommandContext(ctx, p.CmdArgs[0], p.CmdArgs[1:]...)
 	// Process output is logged at a fixed base level; Process.LogLevel only
 	// adjusts the per-group minimum threshold (see Formation.Run), so the two
-	// never cancel each other out.
-	stdout := writelog.Stream(o.logger, p.Tag, slog.LevelInfo)
-	stderr := writelog.Stream(o.logger, p.Tag, slog.LevelInfo)
+	// never cancel each other out. Each stream uses the default bounded queue
+	// (writelog.DefaultMaxQueue); StreamConfig.MaxQueue remains available to
+	// embedders who need to bound it.
+	stdout := writelog.Stream(o.logger, p.Tag, slog.LevelInfo, writelog.StreamConfig{})
+	stderr := writelog.Stream(o.logger, p.Tag, slog.LevelInfo, writelog.StreamConfig{})
 	defer stdout.Close()
 	defer stderr.Close()
 	c.Stdin = nil

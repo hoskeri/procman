@@ -70,14 +70,30 @@ func New(out *os.File, opts *Options) *TermHandler {
 		h.opts.Level = slog.LevelInfo
 	}
 
-	a, err := out.SyscallConn()
-	if err == nil {
-		a.Control(func(fd uintptr) {
-			h.opts.Colors = terminal.IsTerminal(int(fd))
-		})
-	}
+	// Colors explicitly set to true forces color even when the output is not a
+	// terminal (e.g. --output term on a piped stdout). Otherwise color is
+	// auto-detected: enabled only when out is a terminal.
+	h.opts.Colors = h.opts.Colors || IsTerminal(out)
 
 	return h
+}
+
+// IsTerminal reports whether f is a terminal. It mirrors the check TermHandler
+// performs internally so callers can branch on tty-ness (e.g. choosing an
+// output handler) without constructing a handler.
+func IsTerminal(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	conn, err := f.SyscallConn()
+	if err != nil {
+		return false
+	}
+	var isTerm bool
+	_ = conn.Control(func(fd uintptr) {
+		isTerm = terminal.IsTerminal(int(fd))
+	})
+	return isTerm
 }
 
 // WithOverride returns a handler for the given group whose minimum log level
@@ -118,20 +134,20 @@ func (h *TermHandler) Handle(ctx context.Context, rec slog.Record) error {
 	}
 
 	l := len(buf)
-	if h.opts.Columns > 0 {
-		if l > h.opts.Columns {
-			l = h.opts.Columns
-		}
+	if h.opts.Columns > 0 && l > h.opts.Columns {
+		l = h.opts.Columns
 	}
-
-	if buf[l-1] != '\n' {
-		buf = append(buf, '\n')
+	// Emit at most l bytes, ensuring a trailing newline so lines stay intact
+	// for downstream consumers.
+	out := buf[:l]
+	if out[len(out)-1] != '\n' {
+		out = append(out, '\n')
 	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	_, err := h.out.Write(buf)
+	_, err := h.out.Write(out)
 	return err
 }
 

@@ -18,6 +18,7 @@ type procFlags struct {
 	Dotenv    string
 	Formation string
 	Output    string
+	Columns   int
 	Workdir   string
 	Debug     bool
 }
@@ -28,7 +29,29 @@ func (p *procFlags) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVarP(&p.Dotenv, "env", "e", "", "path to dotenv style env file")
 	fs.StringVar(&p.Formation, "formation", "", "optional map of process type=replica-count")
 	fs.StringVar(&p.Output, "output", "auto", "output mode: auto,term")
+	fs.IntVar(&p.Columns, "columns", 0, "truncate log lines to this many characters (0 = off)")
 	fs.BoolVar(&p.Debug, "debug", false, "enable debug logging")
+}
+
+// proclogger builds the process output sink according to --output:
+//
+//	auto - termhandler (colored, prefixed) when stdout is a terminal, a plain
+//	       text handler otherwise (e.g. when piped);
+//	term - always the termhandler, forcing color even when piped.
+//
+// Unknown values behave like auto. In either termhandler case --columns N
+// truncates each log line to N bytes.
+func proclogger(output string, columns int) *slog.Logger {
+	forceColor := output == "term"
+	if forceColor || termhandler.IsTerminal(os.Stdout) {
+		return slog.New(termhandler.New(os.Stdout, &termhandler.Options{
+			Level:   slog.LevelDebug,
+			Columns: columns,
+			Colors:  forceColor,
+		}))
+	}
+	// Piped output: no color, no per-process prefixes.
+	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
 func main() {
@@ -42,9 +65,7 @@ func main() {
 		ll = slog.LevelDebug
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{AddSource: false, Level: ll})))
-	proclogger := slog.New(termhandler.New(os.Stdout, &termhandler.Options{
-		Level: slog.LevelDebug,
-	}))
+	plogger := proclogger(p.Output, p.Columns)
 
 	if p.Workdir == "" {
 		w := filepath.Dir(p.Procfile)
@@ -53,7 +74,7 @@ func main() {
 
 	fm := process.Formation{
 		Workdir: p.Workdir,
-		Sink:    proclogger,
+		Sink:    plogger,
 	}
 
 	if err := fm.LoadFile(p.Procfile); err != nil {

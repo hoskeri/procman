@@ -51,7 +51,13 @@ func TestPerProcessLogLevelOverride(t *testing.T) {
 		Sink: lg,
 		Processes: []*Process{
 			{Tag: "web", CmdArgs: []string{"/bin/sh", "-c", "echo web-message"}},
-			{Tag: "quiet", CmdArgs: []string{"/bin/sh", "-c", "echo quiet-message"}, LogLevel: slog.LevelError},
+			// quiet delays so web deterministically echoes and exits first:
+			// the formation cancel (any process exit kills the group) then
+			// SIGKILLs quiet before it produces output, which is fine — the
+			// assertion below only requires web-message present and
+			// quiet-message suppressed by its Error override. Letting both
+			// children race made this test flaky (web could be killed first).
+			{Tag: "quiet", CmdArgs: []string{"/bin/sh", "-c", "sleep 0.3; echo quiet-message"}, LogLevel: slog.LevelError},
 		},
 	}
 
