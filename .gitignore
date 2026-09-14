@@ -1,4 +1,2 @@
-procman
-trebuchet
+_output/
 *.sw*
-!./cmd/procman

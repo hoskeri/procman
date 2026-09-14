@@ -2,6 +2,7 @@ package process
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -79,6 +80,12 @@ func (l *Formation) Load(src io.ReadCloser) error {
 
 	ps := []*Process{}
 	for _, r := range records {
+		if len(r.CmdArgs) == 0 {
+			// e.g. a line like "web:" — shellwords parses the empty command
+			// into no arguments. Fail fast here instead of panicking on
+			// p.CmdArgs[0] inside a goroutine later.
+			return fmt.Errorf("process %q: no command", r.Tag)
+		}
 		ps = append(ps, &Process{
 			Tag:     r.Tag,
 			CmdArgs: r.CmdArgs,
@@ -97,6 +104,13 @@ type levelSetter interface {
 	WithOverride(name string, lvl slog.Leveler) slog.Handler
 }
 
+// Run executes every process concurrently. The first process to exit on its
+// own — cleanly or crashing — brings the formation down: the siblings are
+// terminated (SIGTERM, then SIGKILL after WaitDelay) and Run returns that
+// process's status as an *ExitError carrying its exit code. If the formation
+// was instead shut down by canceling ctx (e.g. a user interrupt), every
+// process was torn down rather than exiting of its own accord, and Run
+// returns nil.
 func (l *Formation) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -139,22 +153,28 @@ func (ro *runOptions) Apply(os ...runOption) {
 	}
 }
 
+// baseEnv forwards a whitelist of host environment variables to child
+// processes, plus any explicit overrides from e (which win on collision).
+// Variables not listed here are intentionally not inherited; callers that
+// need more must pass them via Process.Environ.
 func baseEnv(e ...string) (ret []string) {
-	for _, e := range []string{
+	for _, k := range []string{
 		"PATH",
 		"HOME",
+		"USER",
 		"USERNAME",
 		"LOGNAME",
 		"SHELL",
 		"TERM",
 		"LANG",
+		"TMPDIR",
 		"HTTP_PROXY",
 		"HTTPS_PROXY",
 		"NO_PROXY",
 	} {
-		v := os.Getenv(e)
+		v := os.Getenv(k)
 		if v != "" {
-			ret = append(ret, e+"="+v)
+			ret = append(ret, k+"="+v)
 		}
 	}
 	return append(ret, e...)
@@ -174,6 +194,12 @@ func (p *Process) run(ctx context.Context, opt ...runOption) error {
 	}
 	o.Apply(opt...)
 
+	if len(p.CmdArgs) == 0 {
+		// Defensive: Formation.Load already rejects empty commands, but a
+		// library caller can construct a Process directly.
+		return fmt.Errorf("%s: no command", p.Tag)
+	}
+
 	c := exec.CommandContext(ctx, p.CmdArgs[0], p.CmdArgs[1:]...)
 	// Process output is logged at a fixed base level; Process.LogLevel only
 	// adjusts the per-group minimum threshold (see Formation.Run), so the two
@@ -190,8 +216,27 @@ func (p *Process) run(ctx context.Context, opt ...runOption) error {
 	c.WaitDelay = 1 * time.Second
 	c.Env = baseEnv(p.Environ...)
 	c.Dir = p.Workdir
+	// Soft shutdown: first TERM the whole process group, then KILL it if it
+	// has not exited within WaitDelay. Processes spawned in the group die
+	// too, so no orphans are left behind. exec's own fallback after WaitDelay
+	// would KILL only the direct child, orphaning any grandchildren of a
+	// TERM-ignoring process, so the group-wide KILL is scheduled here.
 	c.Cancel = func() error {
-		return syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+		err := syscall.Kill(-c.Process.Pid, syscall.SIGTERM)
+		if errors.Is(err, syscall.ESRCH) {
+			// The process is already gone (e.g. it exited just as the context
+			// was canceled); returning the error would surface it to exec as
+			// "exec: canceling Cmd: no such process".
+			return nil
+		}
+		if err == nil {
+			time.AfterFunc(c.WaitDelay, func() {
+				// Best-effort: the group signal is a no-op (ESRCH) if the
+				// process exited during the grace period.
+				_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+			})
+		}
+		return err
 	}
 	c.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
@@ -200,30 +245,61 @@ func (p *Process) run(ctx context.Context, opt ...runOption) error {
 	slog.Debug("c.run", "c.args", p.CmdArgs)
 	err := c.Run()
 	slog.Debug("c.exit", "err", err)
+	// A canceled context here means this process did not stop on its own: the
+	// formation was torn down (user interrupt, or a sibling exiting first) and
+	// the cancellation above killed it. That is not an exit this process chose,
+	// so report nothing and let Formation.Run attribute the outcome. The first
+	// process to exit on its own is exactly the one that observes a live
+	// context: its own return is what cancels the group.
+	if ctx.Err() != nil {
+		return nil
+	}
 	return pf(p.Tag, err)
 }
 
+// ExitError reports that a process exited on its own — the event that brings
+// the whole formation down. Formation.Run returns the first such error, so
+// callers can propagate the process's own status as the formation's status:
+// Code is 0 through 255 for a normal exit, 128+signum when the process died
+// of a signal, and 0 for a clean self-exit.
+type ExitError struct {
+	Tag  string
+	Code int
+	msg  string
+}
+
+func (e *ExitError) Error() string { return e.msg }
+
+// ExitCode follows the convention used by os.Exit and exec.ExitError.
+func (e *ExitError) ExitCode() int { return e.Code }
+
+// pf wraps a process's exit so Formation.Run can attribute the collapse. A
+// nil exec error means a clean self-exit; even that is reported as an error
+// (with code 0) so that any process exiting on its own stops the others too.
 func pf(tag string, err error) error {
 	switch ee := err.(type) {
 	case *exec.ExitError:
-		if ee.ExitCode() == -1 {
-			ws, ok := ee.ProcessState.Sys().(syscall.WaitStatus)
-			if !ok {
-				return fmt.Errorf("%s killed", tag)
-			}
-			return fmt.Errorf("%s signalled, %s", tag, ws.Signal().String())
+		if code := ee.ExitCode(); code != -1 {
+			return &ExitError{Tag: tag, Code: code, msg: fmt.Sprintf("%s exited, exit code %d", tag, code)}
 		}
-		return fmt.Errorf("%s exited, exit code %d", tag, ee.ExitCode())
+		ws, ok := ee.ProcessState.Sys().(syscall.WaitStatus)
+		if !ok {
+			return &ExitError{Tag: tag, Code: 137, msg: fmt.Sprintf("%s killed", tag)}
+		}
+		return &ExitError{Tag: tag, Code: 128 + int(ws.Signal()), msg: fmt.Sprintf("%s signalled, %s", tag, ws.Signal())}
 	case nil:
-		// we return an error here so that any process exiting
-		// also causes the other processes to stop too.
-		return fmt.Errorf("%s exited", tag)
+		return &ExitError{Tag: tag, Code: 0, msg: fmt.Sprintf("%s exited", tag)}
 	}
 
-	return err
+	// Not an exit (e.g. the executable could not be launched): keep the cause,
+	// but tag it so the failure is attributable.
+	return fmt.Errorf("%s: %w", tag, err)
 }
 
 func (p *Process) Exec(ctx context.Context, opt ...runOption) error {
+	if len(p.CmdArgs) == 0 {
+		return fmt.Errorf("%s: no command", p.Tag)
+	}
 	slog.Debug("p.exec", "args", p.CmdArgs)
 	e, err := exec.LookPath(p.CmdArgs[0])
 	if err != nil {

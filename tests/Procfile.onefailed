@@ -1,2 +1,5 @@
-web: ../tools/trebuchet/trebuchet -count=10 -exit-code 1
-work: ../tools/trebuchet/trebuchet -count=100
+# Sample Procfile for integration tests: web fails fast with exit code 1 while
+# work would keep running — the formation must terminate work and exit with
+# web's status. @TREBUCHET@ is substituted by the integration harness.
+web: "@TREBUCHET@" -count=10 -exit-code=1
+work: "@TREBUCHET@" -count=400

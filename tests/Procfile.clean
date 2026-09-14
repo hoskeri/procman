@@ -1,2 +1,6 @@
-web: ../tools/trebuchet/trebuchet
-work: ../tools/trebuchet/trebuchet
+# Sample Procfile for integration tests: two trebuchet processes print a burst
+# of log lines through procman's throttling pipeline, then exit cleanly.
+# @TREBUCHET@ is substituted with the prebuilt trebuchet path by the
+# integration harness (tests/integration_test.go).
+web: "@TREBUCHET@" -count=100
+work: "@TREBUCHET@" -count=100

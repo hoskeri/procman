@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -87,6 +88,20 @@ func main() {
 	defer stop()
 
 	if err := fm.Run(ctx); err != nil {
+		// A process that exited on its own determines the formation's status:
+		// its exit code is the exit code of procman itself. A non-ExitError
+		// (e.g. an executable that failed to launch) is a setup failure -> 1.
+		var pe *process.ExitError
+		if errors.As(err, &pe) {
+			lv := slog.LevelError
+			if pe.Code == 0 {
+				// Clean self-exit: the formation came down on its own, not by
+				// user request — informational, not an error.
+				lv = slog.LevelWarn
+			}
+			slog.Log(ctx, lv, "fm.Run", "err", err)
+			os.Exit(pe.Code)
+		}
 		slog.Error("fm.Run", "err", err)
 		os.Exit(1)
 	}

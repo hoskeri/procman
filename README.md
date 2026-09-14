@@ -28,6 +28,25 @@ procman [-f/--procfile PATH] [-w/--workdir PATH] [-e/--env PATH]
   (default 0 = off).
 - `--debug` — debug logging on stderr.
 
+## Building and testing
+
+`make build` compiles the `procman` CLI and the `tools/trebuchet`
+benchmark utility once into `_output/$(GOOS)_$(GOARCH)/bin/`. `make test`
+then runs the unit tests plus end-to-end integration tests that execute the
+built `procman` against the `tests/Procfile.*` fixtures using `trebuchet` as
+a stand-in user application (clean exit, failed exit propagation, graceful
+interrupt, launch failure, high-volume output).
+
+## Exit status
+
+The first process to exit on its own — cleanly or crashing — brings the
+formation down: the remaining processes are terminated (SIGTERM to the whole
+process group, then SIGKILL after 1s for anything that ignores it) and
+`procman` exits with that process's own exit code (`128+signal` when it died
+of a signal). If every process was instead shut down by an interrupt
+(`SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`), `procman` exits 0. A failure to
+launch a process exits 1.
+
 ## Terminal throttling
 
 Process output is never written to the terminal synchronously on the child's

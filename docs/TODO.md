@@ -156,11 +156,14 @@ Code, tests, and docs:
       but the code sets `1 * time.Second` (`pkg/process/process.go:188`); doc
       updated, and `writelog`/`termhandler` sections refreshed for the
       throttle work.
-- [ ] Integration coverage for `tests/Procfile.clean` and
-      `tests/Procfile.onefailed`: add a `make integration` (or extend
-      `make test`) target that runs the built binary against both Procfiles
-      and asserts exit behavior (clean exit cancels formation; failed exit
-      propagates).
+- [x] Integration coverage for `tests/Procfile.clean` and
+      `tests/Procfile.onefailed`: `make test` now builds all binaries once
+      into `_output/$(GOOS)_$(GOARCH)/bin/` and runs
+      `tests/integration_test.go` against them via `PROCMAN_BIN` (fixtures
+      use a `@TREBUCHET@` placeholder substituted with the built path).
+      Covers clean exit → 0, failed exit → 1 with attribution, graceful
+      SIGINT teardown → 0, launch failure → 1, and a 200-msg trebuchet
+      throughput run. Bare `go test ./...` skips these (no `PROCMAN_BIN`).
 - [ ] Tooling pass: `go fmt -n` is clean and `go vet ./pkg/process` passes
       today — re-run across `./pkg ./cmd ./tools` and keep clean. Note:
       `go vet .` from the repo root reports "no Go files"; vet per package.

@@ -29,7 +29,8 @@ minimal, embeddable alternative to tools like [Foreman][foreman].
 │   └── writelog/             # io.Writer adapter to capture and pipe streams to slog
 │       ├── writelog.go       # Buffers bytes and splits streams by newline for slog
 │       └── writelog_test.go  # Unit & benchmark tests for stream-to-log adapters
-├── tests/                    # Sample Procfiles for integration & regression tests
+├── tests/                    # Integration tests + sample Procfiles
+│   ├── integration_test.go   # Execs the built procman/trebuchet (PROCMAN_BIN)
 │   ├── Procfile.clean        # Sample Procfile with successfully exiting commands
 │   └── Procfile.onefailed    # Sample Procfile where one process fails
 ├── tools/
@@ -64,6 +65,15 @@ parse, execute, and stream output from processes:
       (whether successfully or with an error), the entire group context is
       canceled, resulting in the termination of all other sibling processes.
       This matches Heroku/Foreman behavior.
+    - **Exit semantics:** The first process to exit **on its own** (cleanly or
+      crashing) is the one that brings the formation down; `Run` returns it as
+      an `*ExitError` carrying the process's own exit code (`0` for a clean
+      exit, `128+signum` when it died of a signal, `errors.As`-able in callers).
+      A process killed because the formation was already torn down observes a
+      canceled context and reports nothing, so when the teardown was user
+      initiated (context canceled by a signal handler), `Run` returns `nil`.
+      `pf` attributes the exit; launch failures are tagged with the process
+      name and returned as plain errors.
 
 
 ### B. Procfile Parsing (`pkg/procfile`)
@@ -134,23 +144,30 @@ You can manage the build lifecycle using standard shell commands:
 make build
 ```
 
-Creates the `procman` CLI binary at the root directory and the `trebuchet`
-benchmark utility at `./tools/trebuchet/trebuchet`.
+Builds the `procman` CLI and the `trebuchet` test-fixture utility once each
+into `_output/$(GOOS)_$(GOARCH)/bin/` (default `_output/linux_amd64/bin/`),
+the single shared binary directory for production and tests.
 
-- **Run the unit tests:**
+- **Run all tests (unit + integration):**
 
 ```bash
 make test
 ```
 
-Runs all Go unit and benchmark tests.
+Depends on `build`, then runs `go test -count=1 -v ./...` with
+`PROCMAN_BIN` pointing at the prebuilt binary. `tests/` is a test-only Go
+package (`tests/integration_test.go`) that execs that binary against the
+`tests/Procfile.*` fixtures (trebuchet stands in for the user application)
+and asserts exit behavior end to end. A bare `go test ./...` skips those
+integration tests (no `PROCMAN_BIN`), so unit-only runs still work without
+building binaries.
   - **Clean build artifacts:**
 
 ```bash
 make clean
 ```
 
-Deletes compiled binaries (`procman` and `trebuchet`).
+Deletes `_output/` and any legacy root-level binaries (`./procman`).
 
 ## 6. Shell Command Rules
 
@@ -169,12 +186,20 @@ Deletes compiled binaries (`procman` and `trebuchet`).
     parsing, extend `pkg/procfile/procfile_test.go`.
   - **Context Cleanup**: Ensure that any manual signal handling or parent context
     propagation preserves the cancel propagation. When processes exit, their
-    processes should be reaped cleanly by the OS. The `c.WaitDelay` is set to
-    `1 * time.Second` to allow soft shutdown before hard termination.
-  - **Environment Setup**: The runner utilizes `baseEnv(...)` to forward critical
-    environment variables (`PATH`, `HOME`, `TERM`, `HTTP\_PROXY`, etc.) from the
-    host machine to child processes. When writing tests or running locally,
-    verify these variables are present in the host terminal.
+    processes should be reaped cleanly by the OS. Shutdown is graceful:
+    cancellation sends **SIGTERM to the whole process group** first, and a
+    scheduled group-wide SIGKILL — plus `os/exec`'s own single-process kill —
+    lands after `c.WaitDelay = 1 * time.Second` for processes that ignore
+    SIGTERM. Do not replace `Cancel` with a direct SIGKILL; it defeats the soft
+    shutdown and orphans grandchildren of TERM-ignoring children.
+  - **Environment Setup**: The runner utilizes `baseEnv(...)` to forward a
+    whitelist of critical environment variables (`PATH`, `HOME`, `USER`,
+    `USERNAME`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `TMPDIR`, `HTTP\_PROXY`,
+    etc.) from the host machine to child processes, plus any explicit
+    `Process.Environ` entries that win on collision. Anything not in the list
+    is deliberately not inherited; pass it via `Process.Environ` if a child
+    needs it. When writing tests or running locally, verify these variables are
+    present in the host terminal.
   - **Log API Compatibility**: The library uses Go's standard `log/slog` library
     introduced in Go 1.21. All custom handlers and logging interfaces must
     adhere strictly to `slog.Handler`.
