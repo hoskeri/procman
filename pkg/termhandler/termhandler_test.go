@@ -29,7 +29,7 @@ func TestPerGroupLevelOverride(t *testing.T) {
 
 	// Only the "quiet" group is overridden up; "web" inherits the global Info.
 	web := slog.New(th.WithGroup("web"))
-	quiet := slog.New(th.WithOverride("quiet", slog.LevelError))
+	quiet := slog.New(th.WithGroup("quiet").(*TermHandler).WithOverride("quiet", slog.LevelError))
 
 	web.Info("web info")       // Info >= Info (global) -> logged
 	web.Error("web error")     // logged
@@ -54,7 +54,7 @@ func TestPerGroupLevelOverride(t *testing.T) {
 func TestPerGroupLevelOverrideDown(t *testing.T) {
 	th, buf := newTestHandler(slog.LevelWarn)
 
-	verbose := slog.New(th.WithOverride("verbose", slog.LevelDebug))
+	verbose := slog.New(th.WithGroup("verbose").(*TermHandler).WithOverride("verbose", slog.LevelDebug))
 	verbose.Info("verbose info") // Info >= Debug (override) -> shown despite global Warn
 
 	if !strings.Contains(buf.String(), "verbose info") {

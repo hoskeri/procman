@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -111,12 +113,73 @@ type levelSetter interface {
 // was instead shut down by canceling ctx (e.g. a user interrupt), every
 // process was torn down rather than exiting of its own accord, and Run
 // returns nil.
+//
+// When the environment variable PROCMAN_LOG_FD is set (nested mode), this
+// formation's sink is replaced by a framer that encodes every record as a
+// structured frame over the dedicated log socket to the parent process.
 func (l *Formation) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	eg, ctx := errgroup.WithContext(ctx)
+
+	// --------------------------------------------------------------------
+	// 1. Nesting detection: if this process is itself a child of another
+	//    procman formation, replace the sink with a framer writing to the
+	//    parent's log socket.
+	// --------------------------------------------------------------------
+	if childLogger := writelog.NewChildLogger(); childLogger != nil {
+		l.Sink = childLogger
+	}
+
+	// --------------------------------------------------------------------
+	// 2. Create one SOCK_SEQPACKET socketpair per child for the dedicated
+	//    log channel. The send side (fd 3) is passed to the child process;
+	//    the recv side stays in this process and is read by a relay
+	//    goroutine.
+	// --------------------------------------------------------------------
+	type childChan struct {
+		recvConn *net.UnixConn
+		sendFd   *os.File       // wrapped raw send fd for passing to child
+		tag      string
+	}
+	var chans []childChan
+
 	for _, p := range l.Processes {
+		fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
+		if err != nil {
+			return fmt.Errorf("log socketpair for %s: %w", p.Tag, err)
+		}
+		_ = syscall.SetNonblock(fds[1], true) // send side non-blocking
+		recvConn := writelog.SetupRecvConn(fds[0])
+		if recvConn == nil {
+			syscall.Close(fds[0])
+			syscall.Close(fds[1])
+			return fmt.Errorf("SetupRecvConn for %s failed", p.Tag)
+		}
+		chans = append(chans, childChan{
+			recvConn: recvConn,
+			sendFd:   os.NewFile(uintptr(fds[1]), fmt.Sprintf("log-send-%s", p.Tag)),
+			tag:      p.Tag,
+		})
+	}
+
+	// --------------------------------------------------------------------
+	// 3. Launch one relay goroutine per child socket. Each relay reads
+	//    frames from the recv side and re-emits them into l.Sink with
+	//    the child's tag nested as a group.
+	// --------------------------------------------------------------------
+	var relayWg sync.WaitGroup
+	for _, ch := range chans {
+		writelog.Relay(ch.recvConn, l.Sink, ch.tag, &relayWg)
+	}
+
+	// --------------------------------------------------------------------
+	// 4. Spawn child processes in the errgroup. Each child gets the send
+	//    side of its socketpair at fd 3 and the env PROCMAN_LOG_FD=3.
+	// --------------------------------------------------------------------
+	for i, p := range l.Processes {
+		ch := chans[i]
 		// Give each process its own logger. When the sink's handler supports
 		// per-group overrides and the process carries a non-zero LogLevel,
 		// filter this process's output at that level; otherwise the process
@@ -128,11 +191,12 @@ func (l *Formation) Run(ctx context.Context) error {
 				procLogger = slog.New(ls.WithOverride(p.Tag, p.LogLevel))
 			}
 		}
-
+		p := p
 		eg.Go(func() error {
+			defer ch.sendFd.Close()
 			logger := l.Sink.WithGroup("procman")
 			logger.Warn(fmt.Sprintf("starting %s", p.Tag))
-			err := p.run(ctx, withLogger(procLogger))
+			err := p.run(ctx, withLogger(procLogger), withExtraFiles([]*os.File{ch.sendFd}), withEnvAdd([]string{"PROCMAN_LOG_FD=3"}))
 			if err != nil {
 				logger.Warn(err.Error())
 			}
@@ -140,11 +204,29 @@ func (l *Formation) Run(ctx context.Context) error {
 		})
 	}
 
-	return eg.Wait()
+	err := eg.Wait()
+
+	// --------------------------------------------------------------------
+	// 5. Signal all relays to stop by setting a past deadline on their
+	//    recv sockets (unblocking the reader). Close the recv sockets and
+	//    wait for the relay goroutines to finish.
+	// --------------------------------------------------------------------
+	stopTime := time.Now().Add(-1 * time.Second)
+	for _, ch := range chans {
+		ch.recvConn.SetReadDeadline(stopTime)
+	}
+	for _, ch := range chans {
+		ch.recvConn.Close()
+	}
+	relayWg.Wait()
+
+	return err
 }
 
 type runOptions struct {
-	logger *slog.Logger
+	logger     *slog.Logger
+	extraFiles []*os.File
+	envAdd     []string
 }
 
 func (ro *runOptions) Apply(os ...runOption) {
@@ -188,6 +270,18 @@ func withLogger(l *slog.Logger) runOption {
 	}
 }
 
+func withExtraFiles(files []*os.File) runOption {
+	return func(o *runOptions) {
+		o.extraFiles = files
+	}
+}
+
+func withEnvAdd(entries []string) runOption {
+	return func(o *runOptions) {
+		o.envAdd = entries
+	}
+}
+
 func (p *Process) run(ctx context.Context, opt ...runOption) error {
 	o := &runOptions{
 		logger: slog.Default(),
@@ -214,8 +308,9 @@ func (p *Process) run(ctx context.Context, opt ...runOption) error {
 	c.Stdout = stdout
 	c.Stderr = stderr
 	c.WaitDelay = 1 * time.Second
-	c.Env = baseEnv(p.Environ...)
 	c.Dir = p.Workdir
+	c.ExtraFiles = o.extraFiles
+	c.Env = baseEnv(append(p.Environ, o.envAdd...)...)
 	// Soft shutdown: first TERM the whole process group, then KILL it if it
 	// has not exited within WaitDelay. Processes spawned in the group die
 	// too, so no orphans are left behind. exec's own fallback after WaitDelay
