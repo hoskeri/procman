@@ -67,6 +67,12 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{AddSource: false, Level: ll})))
 	plogger := proclogger(p.Output, p.Columns)
+	// Keystrokes on the foreground terminal would otherwise be echoed into the
+	// streaming log output; procman never reads stdin, so hide them and
+	// restore the terminal state on every exit path (os.Exit bypasses defer,
+	// so the explicit calls below mirror the deferred restore).
+	restoreEcho := termhandler.NoEcho(os.Stdout)
+	defer restoreEcho()
 
 	if p.Workdir == "" {
 		w := filepath.Dir(p.Procfile)
@@ -80,6 +86,7 @@ func main() {
 
 	if err := fm.LoadFile(p.Procfile); err != nil {
 		slog.Error("fm.LoadFile", "err", err)
+		restoreEcho()
 		os.Exit(1)
 	}
 
@@ -100,9 +107,11 @@ func main() {
 				lv = slog.LevelWarn
 			}
 			slog.Log(ctx, lv, "fm.Run", "err", err)
+			restoreEcho()
 			os.Exit(pe.Code)
 		}
 		slog.Error("fm.Run", "err", err)
+		restoreEcho()
 		os.Exit(1)
 	}
 }

@@ -9,6 +9,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
+	"unsafe"
 
 	"github.com/nerdmaster/terminal"
 )
@@ -18,6 +20,11 @@ const (
 	ansiReset = "\033[0m"
 	ansiBold  = "\033[1m"
 )
+
+// echoFlag is the ECHO bit of c_lflag; its value (0x8) is identical across
+// the Unices procman targets (see syscall/zerrors_*; Linux only defines the
+// ECHO* variants, so it is spelled out here).
+const echoFlag = 0x8
 
 var fgcolors = []string{
 	"\033[38;5;1m",
@@ -34,10 +41,74 @@ var fgcolors = []string{
 	"\033[38;5;15m",
 }
 
-func randomColor(tag string) string {
-	h := fnv.New32()
-	h.Write([]byte(tag))
-	return fgcolors[int(h.Sum32())%len(fgcolors)]
+// fgcolors256 spreads 16 hues around the wheel on the 6x6x6 color cube,
+// skipping the grays and whites (7, 15, 231, 251-255) so every entry stays
+// saturated and readable on a dark background.
+var fgcolors256 = []string{
+	"\033[38;5;196m", // red
+	"\033[38;5;208m", // orange
+	"\033[38;5;214m", // goldenrod
+	"\033[38;5;226m", // yellow
+	"\033[38;5;154m", // chartreuse
+	"\033[38;5;46m",  // green
+	"\033[38;5;48m",  // spring green
+	"\033[38;5;51m",  // cyan
+	"\033[38;5;45m",  // turquoise
+	"\033[38;5;39m",  // azure
+	"\033[38;5;27m",  // blue
+	"\033[38;5;63m",  // periwinkle
+	"\033[38;5;99m",  // violet
+	"\033[38;5;129m", // purple
+	"\033[38;5;165m", // magenta
+	"\033[38;5;201m", // pink
+}
+
+// fgcolorsTrue is the 24-bit analogue: saturated hues evenly spaced around
+// the wheel, none of them white or near-white.
+var fgcolorsTrue = []string{
+	"\033[38;2;255;0;0m",      // red
+	"\033[38;2;255;128;0m",    // orange
+	"\033[38;2;255;192;64m",   // amber
+	"\033[38;2;255;255;0m",    // yellow
+	"\033[38;2;160;255;64m",   // chartreuse
+	"\033[38;2;0;255;0m",      // green
+	"\033[38;2;0;255;160m",    // spring green
+	"\033[38;2;0;255;255m",    // cyan
+	"\033[38;2;0;192;255m",    // sky
+	"\033[38;2;0;120;255m",    // azure
+	"\033[38;2;48;80;255m",    // blue
+	"\033[38;2;120;72;255m",   // periwinkle
+	"\033[38;2;180;0;255m",    // purple
+	"\033[38;2;255;0;255m",    // magenta
+	"\033[38;2;255;96;192m",   // pink
+	"\033[38;2;255;128;128m",  // coral
+}
+
+// colorSupport probes the environment the way common terminal tools do:
+// COLORTERM=truecolor|24bit selects 24-bit color, COLORTERM=256color or a
+// TERM ending in -256color selects the 256-color palette, and everything else
+// falls back to the basic 16-color ANSI range.
+func colorSupport() int {
+	ct := os.Getenv("COLORTERM")
+	if ct == "truecolor" || ct == "24bit" {
+		return 2
+	}
+	if ct == "256color" || strings.Contains(os.Getenv("TERM"), "256color") {
+		return 1
+	}
+	return 0
+}
+
+// PaletteFor returns the ANSI prefix palette for a color depth from
+// [colorSupport]: 0 → 16 colors, 1 → 256 colors, 2 → 24-bit truecolor.
+func PaletteFor(depth int) []string {
+	if depth >= 2 {
+		return fgcolorsTrue
+	}
+	if depth == 1 {
+		return fgcolors256
+	}
+	return fgcolors
 }
 
 type Options struct {
@@ -56,6 +127,7 @@ type TermHandler struct {
 	override   slog.Leveler   // per-process level threshold (via WithOverride)
 	color      string         // ANSI color for the innermost group
 	attrs      []slog.Attr
+	palette    []string       // ANSI prefixes selected by colorSupport
 	linePrefix string         // cached render of the full group path
 	prefixVis  int            // visible width of linePrefix (see buildPrefix)
 	mu         *sync.Mutex
@@ -75,6 +147,8 @@ func New(out *os.File, opts *Options) *TermHandler {
 	// Colors auto-detect: enabled only when out is a terminal; --output term
 	// forces them via Options.Colors = true before calling New.
 	h.opts.Colors = h.opts.Colors || IsTerminal(out)
+	// Palette selection mirrors the terminal's color depth (see colorSupport).
+	h.palette = PaletteFor(colorSupport())
 	// Columns auto-resolve: 0 (the default) means "terminal width" when out
 	// is a tty, else no truncation. Negative values keep truncation off.
 	if h.opts.Columns == 0 {
@@ -121,6 +195,49 @@ func IsTerminal(f *os.File) bool {
 	return isTerm
 }
 
+// NoEcho disables terminal echo on f when f is a terminal and returns a
+// function that restores the previous terminal state. It returns a no-op when
+// f is not a terminal or the termios round-trip fails. procman never reads
+// stdin, so without this, keystrokes on the controlling terminal are echoed
+// into the streaming log output — the caller restores the state on every exit
+// path (os.Exit bypasses defer).
+func NoEcho(f *os.File) func() {
+	if f == nil {
+		return func() {}
+	}
+	conn, err := f.SyscallConn()
+	if err != nil {
+		return func() {}
+	}
+	var saved syscall.Termios
+	var ok bool
+	_ = conn.Control(func(fd uintptr) {
+		if _, _, ierr := syscall.Syscall6(syscall.SYS_IOCTL, fd, uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(&saved)), 0, 0, 0); ierr == 0 {
+			off := saved
+			off.Lflag &^= echoFlag
+			if _, _, oerr := syscall.Syscall6(syscall.SYS_IOCTL, fd, uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(&off)), 0, 0, 0); oerr == 0 {
+				ok = true
+			}
+		}
+	})
+	if !ok {
+		return func() {}
+	}
+	return func() {
+		_ = conn.Control(func(fd uintptr) {
+			syscall.Syscall6(syscall.SYS_IOCTL, fd, uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(&saved)), 0, 0, 0)
+		})
+	}
+}
+
+// colorFor hashes tag with FNV-1a to assign a consistent entry from the
+// handler's palette (chosen by colorSupport at New time).
+func (h *TermHandler) colorFor(tag string) string {
+	hv := fnv.New32()
+	hv.Write([]byte(tag))
+	return h.palette[int(hv.Sum32())%len(h.palette)]
+}
+
 // buildPrefix returns the full group path prefix for the current
 // groupPath, optionally colored. Groups are joined with "/" — the restricted
 // tag character set (lowercase alphanumeric + dash) guarantees no ambiguity.
@@ -141,7 +258,7 @@ func (h *TermHandler) buildPrefix() string {
 	prefix := padded + " | "
 
 	if h.opts.Colors && innermost != "" {
-		c := randomColor(innermost)
+		c := h.colorFor(innermost)
 		return string(ansiBold) + c + prefix + ansiReset
 	}
 	return prefix

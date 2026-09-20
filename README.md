@@ -24,6 +24,11 @@ procman [-f/--procfile PATH] [-w/--workdir PATH] [-e/--env PATH]
 - `--output auto|term` — `auto` (default) uses the colored, per-process
   prefixed term handler when stdout is a terminal and a plain text handler
   when piped; `term` forces the term handler (color even when piped).
+  Log line colors are drawn from a 16-color palette, or a wider 256-color /
+  24-bit palette when `TERM`/`COLORTERM` advertise the capability (whites
+  and near-whites are excluded). When stdout is a terminal, terminal echo is
+  disabled while procman runs so keystrokes don't smear into the log stream,
+  and restored on exit.
 - `--columns N` — truncates each term-handler output line to `N` bytes
   (0, the default, uses the terminal width when stdout is a tty; negative
   values disable truncation)

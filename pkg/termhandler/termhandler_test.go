@@ -16,9 +16,10 @@ import (
 func newTestHandler(global slog.Level) (*TermHandler, *bytes.Buffer) {
 	buf := &bytes.Buffer{}
 	return &TermHandler{
-		out:  buf,
-		mu:   &sync.Mutex{},
-		opts: Options{Level: global},
+		out:     buf,
+		mu:      &sync.Mutex{},
+		palette: fgcolors,
+		opts:    Options{Level: global},
 	}, buf
 }
 
@@ -185,6 +186,91 @@ func TestIsTerminal(t *testing.T) {
 	if IsTerminal(w) {
 		t.Error("IsTerminal(pipe) should be false")
 	}
+}
+
+// TestColorSupport verifies the COLORTERM/TERM heuristics used to select the
+// palette depth (0 = 16 colors, 1 = 256, 2 = 24-bit).
+func TestColorSupport(t *testing.T) {
+	oldCt, oldTerm := os.Getenv("COLORTERM"), os.Getenv("TERM")
+	defer func() {
+		os.Setenv("COLORTERM", oldCt)
+		os.Setenv("TERM", oldTerm)
+	}()
+
+	tests := []struct {
+		ct    string
+		term  string
+		want  int
+	}{
+		{"", "", 0},
+		{"", "xterm", 0},
+		{"", "linux", 0},
+		{"", "xterm-256color", 1},
+		{"", "tmux-256color", 1},
+		{"256color", "xterm", 1},
+		{"truecolor", "xterm", 2},
+		{"24bit", "xterm-256color", 2},
+	}
+	for _, tt := range tests {
+		os.Setenv("COLORTERM", tt.ct)
+		os.Setenv("TERM", tt.term)
+		if got := colorSupport(); got != tt.want {
+			t.Errorf("colorSupport(COLORTERM=%q, TERM=%q): got %d, want %d", tt.ct, tt.term, got, tt.want)
+		}
+	}
+}
+
+// TestPaletteFor verifies the palette shapes and that the expanded palettes
+// avoid the white and near-white ANSI slots.
+func TestPaletteFor(t *testing.T) {
+	base := PaletteFor(0)
+	if len(base) == 0 {
+		t.Error("16-color palette must not be empty")
+	}
+
+	p256 := PaletteFor(1)
+	if len(p256) < len(base) {
+		t.Errorf("256-color palette should grow: %d < %d", len(p256), len(base))
+	}
+	for _, c := range p256 {
+		if !strings.HasPrefix(c, "\033[38;5;") {
+			t.Errorf("256-color entry %q not an ANSI 256-color prefix", c)
+		}
+		// Whites/greys to avoid: 7, 15, 231 (cube white), 251-255 (grays).
+		for _, w := range []string{";7m", ";15m", ";231m", ";251m", ";252m", ";253m", ";254m", ";255m"} {
+			if strings.HasSuffix(c, w) {
+				t.Errorf("256-color palette must not use near-white slot %s (%q)", w, c)
+			}
+		}
+	}
+
+	true := PaletteFor(2)
+	if len(true) < len(base) {
+		t.Errorf("24-bit palette should grow: %d < %d", len(true), len(base))
+	}
+	for _, c := range true {
+		if !strings.HasPrefix(c, "\033[38;2;") {
+			t.Errorf("24-bit entry %q not an ANSI truecolor prefix", c)
+		}
+		if strings.Contains(c, "255;255;255") {
+			t.Errorf("24-bit palette must not contain pure white (%q)", c)
+		}
+	}
+}
+
+// TestNoEchoUntaintedPipe verifies NoEcho is a no-op for non-terminals and
+// that the returned restore function can be called harmlessly.
+func TestNoEchoUntaintedPipe(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer r.Close()
+	defer w.Close()
+
+	restore := NoEcho(w)
+	restore() // must not crash or alter anything
+	NoEcho(nil)()
 }
 
 func TestShortenMiddle(t *testing.T) {
