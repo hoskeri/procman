@@ -233,3 +233,53 @@ func TestFormation(t *testing.T) {
 		t.Fatalf("unexpected processes (-want, +got):\n%s", diff)
 	}
 }
+
+// TestTagValidation verifies that Formation.Load rejects invalid tags and
+// that Process.run also rejects them for direct callers.
+func TestTagValidation(t *testing.T) {
+	tests := []struct {
+		tag  string
+		want string // substring expected in error message
+	}{
+		{"WEB", "tag"},
+		{"Web_1", "tag"},
+		{"web.server", "tag"},
+		{"web 1", "tag"},
+		{"-web", "tag"},
+		{"web-", "tag"},
+		{"", "tag"},
+		{"web", ""},       // valid
+		{"web-1", ""},     // valid
+		{"node", ""},       // valid
+		{"node-1", ""},     // valid
+		{"a", ""},          // valid (single char)
+		{"0", ""},          // valid (single digit)
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.tag, func(t *testing.T) {
+			// Test via Formation.Load
+			frm := &Formation{}
+			err := frm.Load(io.NopCloser(strings.NewReader(tt.tag + ": echo hi")))
+			if tt.want == "" {
+				if err != nil {
+					t.Errorf("Load: expected nil, got %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("Load: expected error containing %q, got %v", tt.want, err)
+			}
+
+			// Test via direct Process.run
+			p := &Process{Tag: tt.tag, CmdArgs: []string{"true"}}
+			err = p.run(context.Background(), withLogger(discardLogger()))
+			if tt.want == "" {
+				// A valid tag may still produce an exit error, but not a tag error.
+				if err != nil && strings.Contains(err.Error(), "tag must be") {
+					t.Errorf("run: unexpected tag error for valid tag: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "tag must be") {
+				t.Errorf("run: expected tag validation error, got %v", err)
+			}
+		})
+	}
+}

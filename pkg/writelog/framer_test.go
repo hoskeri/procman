@@ -2,6 +2,7 @@ package writelog
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"strings"
@@ -11,28 +12,34 @@ import (
 	"time"
 )
 
-// TestFrameRoundTrip verifies that a Frame survives marshal/unmarshal with
-// all fields preserved.
+// TestFrameRoundTrip verifies that a Frame survives MarshalBinary/UnmarshalBinary
+// with all fields preserved.
 func TestFrameRoundTrip(t *testing.T) {
+	// Build attrs as JSON bytes (what FramerHandler produces)
+	attrsJSON, _ := json.Marshal(map[string]any{"pid": float64(42), "signal": "SIGKILL"})
+
 	orig := Frame{
-		Version: 1,
-		Level:   int(slog.LevelError),
-		Tag:     "kubelet",
-		Message: "out of memory",
-		Groups:  []string{"kubelet"},
-		Attrs:   map[string]any{"pid": float64(42), "signal": "SIGKILL"},
+		Version:   1,
+		Level:     int(slog.LevelError),
+		Tag:       "kubelet",
+		Message:   "out of memory",
+		Groups:    []string{"kubelet"},
+		AttrsJSON: attrsJSON,
 	}
-	b, err := orig.Marshal()
+	b, err := orig.MarshalBinary()
 	if err != nil {
-		t.Fatalf("Marshal: %v", err)
+		t.Fatalf("MarshalBinary: %v", err)
 	}
 	if len(b) == 0 {
 		t.Fatal("empty marshal")
 	}
+	if b[0] != frameVersion {
+		t.Errorf("first byte: got %d, want %d", b[0], frameVersion)
+	}
 
 	var got Frame
-	if err := got.Unmarshal(b); err != nil {
-		t.Fatalf("Unmarshal: %v", err)
+	if err := got.UnmarshalBinary(b); err != nil {
+		t.Fatalf("UnmarshalBinary: %v", err)
 	}
 
 	if got.Version != orig.Version {
@@ -50,8 +57,65 @@ func TestFrameRoundTrip(t *testing.T) {
 	if len(got.Groups) != 1 || got.Groups[0] != "kubelet" {
 		t.Errorf("Groups: got %v, want %v", got.Groups, orig.Groups)
 	}
-	if got.Attrs["pid"] != float64(42) || got.Attrs["signal"] != "SIGKILL" {
-		t.Errorf("Attrs: got %v, want %v", got.Attrs, orig.Attrs)
+	if len(got.AttrsJSON) == 0 {
+		t.Fatal("expected non-empty AttrsJSON")
+	}
+	var attrsMap map[string]any
+	if err := json.Unmarshal(got.AttrsJSON, &attrsMap); err != nil {
+		t.Fatalf("unmarshal attrs: %v", err)
+	}
+	if attrsMap["pid"] != float64(42) || attrsMap["signal"] != "SIGKILL" {
+		t.Errorf("Attrs: got %v", attrsMap)
+	}
+}
+
+// TestFrameRoundTripNoAttrs verifies the common case (no attrs) round-trips.
+func TestFrameRoundTripNoAttrs(t *testing.T) {
+	orig := Frame{
+		Version: 1,
+		Level:   0,
+		Tag:     "web",
+		Message: "started",
+		Groups:  []string{"web", "procman"},
+	}
+	b, err := orig.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+	var got Frame
+	if err := got.UnmarshalBinary(b); err != nil {
+		t.Fatalf("UnmarshalBinary: %v", err)
+	}
+	if got.Message != "started" || got.Tag != "web" {
+		t.Errorf("round-trip: got %+v", got)
+	}
+	if len(got.AttrsJSON) != 0 {
+		t.Errorf("expected no attrs, got %d bytes", len(got.AttrsJSON))
+	}
+}
+
+// TestIsFramePrefix verifies the fast gate for the dual-mode relay.
+func TestIsFramePrefix(t *testing.T) {
+	// Binary frame header starts with frameVersion.
+	f := Frame{Version: 1, Level: 0, Message: "test"}
+	b, _ := f.MarshalBinary()
+	if !IsFramePrefix(b) {
+		t.Error("expected IsFramePrefix true for binary frame")
+	}
+
+	// Text: random ASCII should be false.
+	if IsFramePrefix([]byte("hello world\n")) {
+		t.Error("expected IsFramePrefix false for text")
+	}
+
+	// Short buffer should be false.
+	if IsFramePrefix([]byte{0x01}) {
+		t.Error("expected IsFramePrefix false for short buffer")
+	}
+
+	// Wrong version byte should be false.
+	if IsFramePrefix([]byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) {
+		t.Error("expected IsFramePrefix false for wrong version")
 	}
 }
 
@@ -61,21 +125,26 @@ type captureHandler struct {
 	fn func(context.Context, slog.Record) error
 }
 
-func (h *captureHandler) Enabled(ctx context.Context, l slog.Level) bool  { return true }
-func (h *captureHandler) Handle(ctx context.Context, r slog.Record) error { return h.fn(ctx, r) }
-func (h *captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler        { return h }
-func (h *captureHandler) WithGroup(name string) slog.Handler              { return h }
+func (h *captureHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+func (h *captureHandler) Handle(ctx context.Context, r slog.Record) error {
+	return h.fn(ctx, r)
+}
+func (h *captureHandler) WithAttrs(_ []slog.Attr) slog.Handler   { return h }
+func (h *captureHandler) WithGroup(_ string) slog.Handler        { return h }
 
 // TestFramerRelayRoundTrip creates a socketpair, writes frames from a
-// FramerHandler, reads them via a relay, and verifies the record arrives at
+// FramerHandler, reads them via DualRelay, and verifies the record arrives at
 // the parent sink with levels, message, tag, and attrs preserved.
 func TestFramerRelayRoundTrip(t *testing.T) {
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sendFd := SetupSendSocket(fds[1])
-	_ = syscall.SetNonblock(fds[1], true)
+	// Send side: set non-blocking (as the child's NewChildFramer would).
+	if err := syscall.SetNonblock(fds[1], true); err != nil {
+		t.Fatal(err)
+	}
+	sendFd := fds[1]
 	recvConn := SetupRecvConn(fds[0])
 
 	var (
@@ -91,9 +160,9 @@ func TestFramerRelayRoundTrip(t *testing.T) {
 		return nil
 	}})
 
-	// Start relay
+	// Start DualRelay
 	var relayWg sync.WaitGroup
-	Relay(recvConn, recorder, "parent", &relayWg)
+	DualRelay(recvConn, recorder, "parent", &relayWg)
 
 	time.Sleep(10 * time.Millisecond) // let relay goroutine start
 
@@ -101,7 +170,6 @@ func TestFramerRelayRoundTrip(t *testing.T) {
 	framer := NewFramer(sendFd, slog.LevelInfo)
 	framer = framer.WithGroup("child").WithAttrs([]slog.Attr{slog.Int("count", 7)}).(*FramerHandler)
 	framerLogger := slog.New(framer)
-	// writelog.Stream stamps a "tag" attr matching the process tag.
 	framerLogger.With(slog.String("tag", "child")).Warn("hello from child")
 
 	syscall.Close(sendFd)
@@ -122,7 +190,6 @@ func TestFramerRelayRoundTrip(t *testing.T) {
 		t.Errorf("level: got %v, want %v", r.Level, slog.LevelWarn)
 	}
 
-	// Check that the tag attr arrived.
 	var tagSeen string
 	r.Attrs(func(a slog.Attr) bool {
 		if a.Key == "tag" {
@@ -132,6 +199,119 @@ func TestFramerRelayRoundTrip(t *testing.T) {
 	})
 	if tagSeen != "child" {
 		t.Errorf("tag attr: got %q, want %q", tagSeen, "child")
+	}
+}
+
+// TestDualRelayTextFallback verifies that text messages written to the socket
+// by a non-procman child are split on newlines and logged correctly.
+func TestDualRelayTextFallback(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendFd := fds[1]
+	recvConn := SetupRecvConn(fds[0])
+
+	var (
+		mu   sync.Mutex
+		got  []string
+	)
+	recorder := slog.New(&captureHandler{fn: func(ctx context.Context, r slog.Record) error {
+		mu.Lock()
+		got = append(got, r.Message)
+		mu.Unlock()
+		return nil
+	}})
+
+	var relayWg sync.WaitGroup
+	DualRelay(recvConn, recorder, "child", &relayWg)
+
+	time.Sleep(10 * time.Millisecond)
+
+	// Write text as a non-procman child would.
+	syscall.Write(sendFd, []byte("line1\nline2\n"))
+	syscall.Write(sendFd, []byte("partial"))
+
+	syscall.Close(sendFd)
+	relayWg.Wait()
+	recvConn.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(got) != 3 {
+		t.Fatalf("expected 3 lines, got %d: %v", len(got), got)
+	}
+	if got[0] != "line1\n" {
+		t.Errorf("line0: got %q, want %q", got[0], "line1\\n")
+	}
+	if got[1] != "line2\n" {
+		t.Errorf("line1: got %q, want %q", got[1], "line2\\n")
+	}
+	if got[2] != "partial" {
+		t.Errorf("line2: got %q, want %q", got[2], "partial")
+	}
+}
+
+// TestDualRelayMixed verifies that a mix of frames and text is handled
+// correctly.  A procman child writes a frame, then a non-procman sibling
+// writes text.
+func TestDualRelayMixed(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.SetNonblock(fds[1], true); err != nil {
+		t.Fatal(err)
+	}
+	sendFd := fds[1]
+	recvConn := SetupRecvConn(fds[0])
+
+	var (
+		mu  sync.Mutex
+		got []slog.Record
+	)
+	recorder := slog.New(&captureHandler{fn: func(ctx context.Context, r slog.Record) error {
+		mu.Lock()
+		got = append(got, r)
+		mu.Unlock()
+		return nil
+	}})
+
+	var relayWg sync.WaitGroup
+	DualRelay(recvConn, recorder, "mixed", &relayWg)
+
+	time.Sleep(10 * time.Millisecond)
+
+	// Write a frame (procman child style).
+	framer := NewFramer(sendFd, slog.LevelDebug)
+	framerLogger := slog.New(framer)
+	framerLogger.With(slog.String("tag", "proc-child")).Info("structured message")
+
+	// Write text (non-procman child style — need to re-enable blocking
+	// writes; but the framer set O_NONBLOCK. For this test we syscall.Write
+	// directly since we know the socket buffer has room).
+	syscall.Write(sendFd, []byte("text line\n"))
+
+	syscall.Close(sendFd)
+	relayWg.Wait()
+	recvConn.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 records, got %d: %+v", len(got), got)
+	}
+
+	// First: frame.
+	if got[0].Message != "structured message" {
+		t.Errorf("frame message: got %q, want %q", got[0].Message, "structured message")
+	}
+
+	// Second: text line.
+	if !strings.Contains(got[1].Message, "text line") {
+		t.Errorf("text message: got %q, want containing %q", got[1].Message, "text line")
 	}
 }
 
@@ -185,7 +365,7 @@ func TestRelayTeardown(t *testing.T) {
 	sink := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	var wg sync.WaitGroup
-	Relay(recvConn, sink, "teardown-test", &wg)
+	DualRelay(recvConn, sink, "teardown-test", &wg)
 
 	time.Sleep(10 * time.Millisecond) // let it start
 
@@ -205,4 +385,55 @@ func TestRelayTeardown(t *testing.T) {
 		t.Fatal("relay did not exit within 3s after SetReadDeadline past")
 	}
 	recvConn.Close()
+}
+
+// TestTextBuf verifies that textBuf correctly tracks partial lines across
+// multiple feed calls and flushes the final partial line.
+func BenchmarkFrameEncodeDecode(b *testing.B) {
+	f := Frame{
+		Version: 1,
+		Level:   int(slog.LevelInfo),
+		Tag:     "kubelet",
+		Message: "hello from the child formation process",
+		Groups:  []string{"procman", "kubelet"},
+	}
+	buf, _ := f.MarshalBinary()
+
+	b.Run("Encode", func(b *testing.B) {
+		for range b.N {
+			f.MarshalBinary()
+		}
+	})
+	b.Run("Decode", func(b *testing.B) {
+		for range b.N {
+			var got Frame
+			got.UnmarshalBinary(buf)
+		}
+	})
+}
+
+func TestTextBuf(t *testing.T) {
+	var got []string
+	emit := func(line string) { got = append(got, line) }
+
+	var tb textBuf
+	tb.feed("line1\nline2\n", emit)
+	if len(got) != 2 || got[0] != "line1\n" || got[1] != "line2\n" {
+		t.Fatalf("after feed 1: got %v", got)
+	}
+
+	tb.feed("par", emit)
+	if len(got) != 2 {
+		t.Fatalf("partial should not emit: got %v", got)
+	}
+
+	tb.feed("tial\nend", emit)
+	if len(got) != 3 || got[2] != "partial\n" {
+		t.Fatalf("after feed 3: got %v", got)
+	}
+
+	tb.flush(emit)
+	if len(got) != 4 || got[3] != "end" {
+		t.Fatalf("after flush: got %v", got)
+	}
 }

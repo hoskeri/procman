@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/nerdmaster/terminal"
@@ -40,7 +41,11 @@ func randomColor(tag string) string {
 }
 
 type Options struct {
-	Level   slog.Leveler
+	Level slog.Leveler
+	// Columns truncates each emitted line (prefix included) to this many
+	// bytes. 0 (the default) auto-resolves to the terminal width when the
+	// output is a tty, leaving truncation off otherwise; negative values
+	// disable truncation explicitly.
 	Columns int
 	Colors  bool
 }
@@ -52,6 +57,7 @@ type TermHandler struct {
 	color      string         // ANSI color for the innermost group
 	attrs      []slog.Attr
 	linePrefix string         // cached render of the full group path
+	prefixVis  int            // visible width of linePrefix (see buildPrefix)
 	mu         *sync.Mutex
 	out        io.Writer
 }
@@ -69,7 +75,32 @@ func New(out *os.File, opts *Options) *TermHandler {
 	// Colors auto-detect: enabled only when out is a terminal; --output term
 	// forces them via Options.Colors = true before calling New.
 	h.opts.Colors = h.opts.Colors || IsTerminal(out)
+	// Columns auto-resolve: 0 (the default) means "terminal width" when out
+	// is a tty, else no truncation. Negative values keep truncation off.
+	if h.opts.Columns == 0 {
+		h.opts.Columns = TerminalWidth(out)
+	}
 	return h
+}
+
+// TerminalWidth reports the width in columns of f when it is a terminal, or 0
+// otherwise (including when f is nil or the size query fails). It backs the
+// Options.Columns auto-resolution in New.
+func TerminalWidth(f *os.File) int {
+	if f == nil {
+		return 0
+	}
+	conn, err := f.SyscallConn()
+	if err != nil {
+		return 0
+	}
+	var width int
+	_ = conn.Control(func(fd uintptr) {
+		if w, _, werr := terminal.GetSize(int(fd)); werr == nil && w > 0 {
+			width = w
+		}
+	})
+	return width
 }
 
 // IsTerminal reports whether f is a terminal. It mirrors the check TermHandler
@@ -90,8 +121,9 @@ func IsTerminal(f *os.File) bool {
 	return isTerm
 }
 
-// buildPrefix returns the full group path prefix string for the current
-// groupPath, optionally colored. Color is derived from the innermost group.
+// buildPrefix returns the full group path prefix for the current
+// groupPath, optionally colored. Groups are joined with "/" — the restricted
+// tag character set (lowercase alphanumeric + dash) guarantees no ambiguity.
 func (h *TermHandler) buildPrefix() string {
 	// innermost group for color
 	innermost := ""
@@ -99,16 +131,36 @@ func (h *TermHandler) buildPrefix() string {
 		innermost = h.groupPath[len(h.groupPath)-1]
 	}
 
-	var prefix string
-	for _, g := range h.groupPath {
-		prefix += fmt.Sprintf("%16s | ", g)
-	}
+	// Combine all groups into a single path, right-justified in 16 columns.
+	combined := strings.Join(h.groupPath, "/")
+	padded := fmt.Sprintf("%16s", shortenMiddle(combined, 16))
+	// The uncolored prefix is padded (always exactly 16 ASCII bytes, since
+	// tags are restricted to lowercase alphanumerics and dashes) plus
+	// " | " — so its visible width is known without any escape scanning.
+	h.prefixVis = len(padded) + 3
+	prefix := padded + " | "
 
 	if h.opts.Colors && innermost != "" {
 		c := randomColor(innermost)
 		return string(ansiBold) + c + prefix + ansiReset
 	}
 	return prefix
+}
+
+// shortenMiddle truncates s to fit maxLen by replacing the middle section
+// with "...".  If s already fits it is returned unchanged.
+func shortenMiddle(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	ellipsis := "..."
+	avail := maxLen - len(ellipsis)
+	if avail < 2 {
+		return s[:maxLen]
+	}
+	left := (avail + 1) / 2 // left-heavy bias
+	right := avail - left
+	return s[:left] + ellipsis + s[len(s)-right:]
 }
 
 // WithOverride returns a handler that overrides the minimum log level for
@@ -147,16 +199,25 @@ func (h *TermHandler) Handle(ctx context.Context, rec slog.Record) error {
 		return nil
 	}
 
-	buf := []byte(h.linePrefix + rec.Message)
-	if len(buf) == 0 {
-		return nil
+	// Trim the message *before* prepending the colored prefix: the prefix's
+	// visible width is fixed (prefixVis), so the budget left for the payload
+	// is Columns minus that. No escape scanning is needed — the ANSI codes
+	// are added afterwards and never land in the trimmed region. Escapes
+	// inside child output still count as bytes here (they are rare, and a
+	// cut inside one is self-healing: an ESC begins every new line and
+	// aborts any dangling sequence).
+	msg := rec.Message
+	if h.opts.Columns > 0 {
+		avail := h.opts.Columns - h.prefixVis
+		if avail < 0 {
+			avail = 0
+		}
+		if len(msg) > avail {
+			msg = msg[:avail]
+		}
 	}
 
-	l := len(buf)
-	if h.opts.Columns > 0 && l > h.opts.Columns {
-		l = h.opts.Columns
-	}
-	out := buf[:l]
+	out := []byte(h.linePrefix + msg)
 	if out[len(out)-1] != '\n' {
 		out = append(out, '\n')
 	}

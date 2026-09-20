@@ -102,7 +102,8 @@ func TestOverrideSurvivesReGroup(t *testing.T) {
 }
 
 // TestColumnsTruncation verifies that Options.Columns truncates a log message
-// to at most Columns bytes before it reaches the output writer.
+// to at most Columns visible bytes (ANSI escapes occupy no columns) before it
+// reaches the output writer.
 func TestColumnsTruncation(t *testing.T) {
 	th, buf := newTestHandler(slog.LevelInfo)
 	th.opts.Columns = 8
@@ -114,6 +115,33 @@ func TestColumnsTruncation(t *testing.T) {
 
 	if got, want := buf.String(), "aaaaaaaa\n"; got != want {
 		t.Errorf("Columns=8 truncation: want %q, got %q", want, got)
+	}
+}
+
+// TestColumnsTruncationAnsi verifies that the colored prefix's ANSI escape
+// sequences do not consume the truncation budget: with Columns=21 the line
+// keeps the full colored prefix (19 visible chars) plus exactly 2 payload
+// bytes, even though the raw byte length of the prefix alone far exceeds the
+// budget — a naive byte-counting truncator would cut inside the prefix and
+// drop every payload byte.
+func TestColumnsTruncationAnsi(t *testing.T) {
+	th, buf := newTestHandler(slog.LevelInfo)
+	th.opts.Colors = true
+	th.opts.Columns = 21
+	th.groupPath = []string{"web"}
+	th.linePrefix = th.buildPrefix()
+
+	rec := slog.NewRecord(time.Time{}, slog.LevelInfo, strings.Repeat("a", 30), 0)
+	if err := th.Handle(context.Background(), rec); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	out := buf.String()
+	if got := strings.Count(out, "a"); got != 2 {
+		t.Errorf("escape-aware truncation: want 2 visible a's, got %d (line %q)", got, out)
+	}
+	if !strings.HasSuffix(out, "aa\n") {
+		t.Errorf("expected the line to end with %q, got %q", "aa\\n", out)
 	}
 }
 
@@ -136,7 +164,10 @@ func TestNewColorsForced(t *testing.T) {
 		t.Error("non-terminal without forced color should not enable color")
 	}
 	if New(w, &Options{}).opts.Columns != 0 {
-		t.Error("Options.Columns should default to 0 (truncation off)")
+		t.Error("Options.Columns should default to 0 for non-terminal output (truncation off)")
+	}
+	if New(w, &Options{Columns: -1}).opts.Columns != -1 {
+		t.Error("negative Options.Columns should be preserved (truncation disabled)")
 	}
 }
 
@@ -153,5 +184,35 @@ func TestIsTerminal(t *testing.T) {
 	defer w.Close()
 	if IsTerminal(w) {
 		t.Error("IsTerminal(pipe) should be false")
+	}
+}
+
+func TestShortenMiddle(t *testing.T) {
+	tests := []struct {
+		input   string
+		maxLen  int
+		want    string
+	}{
+		{"web", 16, "web"},
+		{"node-1/kubelet", 16, "node-1/kubelet"},
+		{"node-1/kubelet/cri", 16, "node-1/...et/cri"},
+		{"node-1/kubelet/cri-server", 16, "node-1/...server"},
+		{"node-1/kubelet/cri-server", 8, "nod...er"},
+		{"abc", 3, "abc"},
+		{"abcd", 3, "abc"},
+		{"a", 1, "a"},
+		{"", 16, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := shortenMiddle(tt.input, tt.maxLen)
+			if len(got) > tt.maxLen {
+				t.Errorf("length: got %d, want <= %d", len(got), tt.maxLen)
+			}
+			if got != tt.want {
+				t.Errorf("shortenMiddle(%q, %d): got %q, want %q", tt.input, tt.maxLen, got, tt.want)
+			}
+		})
 	}
 }

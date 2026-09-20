@@ -25,6 +25,8 @@ procman [-f/--procfile PATH] [-w/--workdir PATH] [-e/--env PATH]
   prefixed term handler when stdout is a terminal and a plain text handler
   when piped; `term` forces the term handler (color even when piped).
 - `--columns N` — truncates each term-handler output line to `N` bytes
+  (0, the default, uses the terminal width when stdout is a tty; negative
+  values disable truncation)
   (default 0 = off).
 - `--debug` — debug logging on stderr.
 

@@ -13,7 +13,7 @@ TREBUCHET := $(OUT)/trebuchet
 
 build: $(PROCMAN) $(TREBUCHET)
 
-$(PROCMAN): $(shell find cmd -name '*.go') go.mod go.sum
+$(PROCMAN): $(shell find cmd pkg -name '*.go') go.mod go.sum
 	@mkdir -p $(OUT)
 	$(GO) build -o $(PROCMAN) ./cmd/procman
 

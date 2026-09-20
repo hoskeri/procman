@@ -30,7 +30,7 @@ func (p *procFlags) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVarP(&p.Dotenv, "env", "e", "", "path to dotenv style env file")
 	fs.StringVar(&p.Formation, "formation", "", "optional map of process type=replica-count")
 	fs.StringVar(&p.Output, "output", "auto", "output mode: auto,term")
-	fs.IntVar(&p.Columns, "columns", 0, "truncate log lines to this many characters (0 = off)")
+	fs.IntVar(&p.Columns, "columns", 0, "truncate log lines to this many characters (0 = terminal width, <0 = off)")
 	fs.BoolVar(&p.Debug, "debug", false, "enable debug logging")
 }
 
