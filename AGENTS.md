@@ -24,11 +24,14 @@ minimal, embeddable alternative to tools like [Foreman][foreman].
 │   ├── process/              # Core process representation and execution
 │   │   ├── process.go        # Spawns & monitors processes under errgroup.Group
 │   │   └── process_test.go   # Unit tests for execution and formation wiring
-│   ├── termhandler/          # slog.Handler for colorful process-specific prefixes
-│   │   └── termhandler.go    # Prepends bold, colored tags to log lines
-│   └── writelog/             # io.Writer adapter to capture and pipe streams to slog
-│       ├── writelog.go       # Buffers bytes and splits streams by newline for slog
-│       └── writelog_test.go  # Unit & benchmark tests for stream-to-log adapters
+│   ├── termhandler/          # Output facade: terminal rendering + child log channels
+│   │   ├── termhandler.go    # renderer (colored prefixes) + TermHandler facade (ChildFDs)
+│   │   └── termhandler_test.go
+│   └── writelog/             # Stream adapters, framers, and relays to slog
+│       ├── writelog.go       # Bounded queue; splits streams by newline for slog
+│       ├── framer.go         # Binary SOCK_SEQPACKET frames + FramerHandler
+│       ├── relay.go          # DualRelay (frame or text) + ChildSinks probe
+│       └── *_test.go
 ├── tests/                    # Integration tests + sample Procfiles
 │   ├── integration_test.go   # Execs the built procman/trebuchet (PROCMAN_BIN)
 │   ├── Procfile.clean        # Sample Procfile with successfully exiting commands
@@ -59,6 +62,18 @@ parse, execute, and stream output from processes:
     `LoadFile` (or `New`) resolves the working directory and delegates parsing
     to **`pkg/procfile`**; `Load` converts the parsed records into `Process`
     structs wired to the formation's `Workdir`.
+    - Takes a `process.LogSink` (`Logger() *slog.Logger` + `ChildFDs(tag,
+      index, level)`) as `Formation.Logs`. `Run` asks the sink for per-child
+      stdout/stderr descriptors and wires them into each `exec.Cmd`; the sink
+      (e.g. `*termhandler.TermHandler`) owns the transport, root/nested
+      detection, and relays. When `Logs` is nil, output falls back to the
+      `writelog` text pipeline into `slog.Default()`.
+    - `Formation.LogLevels` (`process.LogLevels`) carries a default log level
+      plus per-tag overrides. `Run` resolves each process's level with
+      explicit `Process.LogLevel` > tag override > default, and passes it to
+      `ChildFDs`. `process.ParseLogLevels(spec, def)` parses the
+      `"info,api=debug"` CLI form and seeds `def` so an overrides-only spec
+      keeps the caller's default.
     - Orchestrates execution inside `Run(ctx)`. Processes are started in
       parallel using an **`golang.org/x/sync/errgroup.Group`**.
     - **Crucial Behavior:** Under the `errgroup`, if any single process exits
@@ -108,19 +123,29 @@ parse, execute, and stream output from processes:
       then flushes any partial last line that lacked a trailing newline.
 
 
-### D. Aesthetic Terminal Logging (`pkg/termhandler`)
+### D. Output Facade (`pkg/termhandler`)
 
-- **`TermHandler`** (defined in `pkg/termhandler/termhandler.go`): Implements
-  `slog.Handler` on top of a standard file/writer output.
-    - Automatically checks if the writer is a terminal using `terminal.IsTerminal`
-      and toggles ANSI color escape codes accordingly. `Options.Colors: true`
-      forces color even on non-terminals (`--output term`).
-    - `Options.Columns > 0` truncates each emitted line (prefix included) to
-      `Columns` bytes.
-    - Hashes the process `Tag` using FNV-1a to dynamically assign a consistent,
-      random, high-contrast ANSI foreground color from a pre-defined palette.
-    - Prefixes every printed log message with a bold, colorful label (e.g., `web
-      |`) padded to a fixed width of 16 characters to align the logs nicely.
+- **`TermHandler`** (defined in `pkg/termhandler/termhandler.go`): the output
+  facade for a formation. Built by `New(ctx, stdin, stdout, stderr, opts)`.
+    - Owns **root vs. nested** detection: `seqpacketFd` probes stdout/stderr
+      for a parent formation's `SOCK_SEQPACKET` log socket. Root mode renders
+      locally; nested mode frames records through `writelog.NewFramer`.
+    - Owns **terminal state**: on the first tty stream (stdin preferred) it
+      calls `NoEcho` and restores termios on `Close`; the `ctx` triggers
+      `Close` via `context.AfterFunc`.
+    - Owns **child channels**: `ChildFDs(tag, index, level)` creates a
+      per-child `SOCK_SEQPACKET` socketpair, starts a `DualRelay` into the
+      matching sink, and returns child stdout/stderr `*os.File`s. A positive
+      `index` becomes a `tag-index` identity for replicas. `Close` drains
+      relays, then force-closes after a grace period.
+    - `Options.Plain` selects a plain `slog.TextHandler` renderer instead of
+      the colored one (`--output auto` on a pipe); `Options.Colors` forces
+      color (`--output term`).
+- **`renderer`** (unexported): the historical `slog.Handler` that prefixes
+  each line with a bold, tag-derived color label. Checks
+  `terminal.IsTerminal` for auto color, truncates to `Options.Columns`, and
+  hashes the tag with FNV-1a for a consistent palette entry. Prefixes are
+  padded to 16 columns (e.g. `             web | `).
 
 
 ## 4. Helper Tools & Diagnostics

@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/hoskeri/procman/pkg/writelog"
 )
 
 // procmanBin resolves the prebuilt procman binary, skipping the test when the
@@ -166,5 +168,93 @@ func TestHighVolumeThroughput(t *testing.T) {
 	_, stderr, exit := runProcman(t, pf)
 	if exit != 0 {
 		t.Errorf("expected exit 0, got %d (stderr: %s)", exit, stderr)
+	}
+}
+
+// readFrames reads every SEQPACKET message from fd until EOF, decoding each
+// as a writelog.Frame. Non-frame messages are logged and skipped.
+func readFrames(t *testing.T, fd int) []writelog.Frame {
+	t.Helper()
+	f := os.NewFile(uintptr(fd), "nested-frames")
+	defer f.Close()
+	var frames []writelog.Frame
+	buf := make([]byte, 20000)
+	for {
+		n, err := f.Read(buf)
+		if n == 0 || err != nil {
+			break
+		}
+		var fr writelog.Frame
+		if err := fr.UnmarshalBinary(buf[:n]); err != nil {
+			t.Logf("nested: non-frame message (%d bytes): %q", n, buf[:n])
+			continue
+		}
+		frames = append(frames, fr)
+	}
+	return frames
+}
+
+// frameWithMessage returns the first frame whose message contains substr.
+func frameWithMessage(frames []writelog.Frame, substr string) (writelog.Frame, bool) {
+	for _, f := range frames {
+		if strings.Contains(f.Message, substr) {
+			return f, true
+		}
+	}
+	return writelog.Frame{}, false
+}
+
+// TestNestedStreamsFramed runs procman with its stdout and stderr connected to
+// SOCK_SEQPACKET sockets, exactly as a parent formation would.  procman must
+// detect the nested role and frame its records, stamping each with its
+// originating stream.  It writes a process to stdout/stderr and then exits on
+// its own, which makes the lifecycle result land on the stderr framer too.
+func TestNestedStreamsFramed(t *testing.T) {
+	pf := writeProcfile(t, `web: sh -c 'echo hello-stdout; echo hello-stderr >&2'`)
+
+	stdoutSP, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderrSP, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(procmanBin(t), "-f", pf)
+	cmd.Stdout = os.NewFile(uintptr(stdoutSP[1]), "nested-stdout")
+	cmd.Stderr = os.NewFile(uintptr(stderrSP[1]), "nested-stderr")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start nested procman: %v", err)
+	}
+	// Drop the parent's copies of the send ends so the recv reads see EOF
+	// once the child exits.
+	cmd.Stdout.(*os.File).Close()
+	cmd.Stderr.(*os.File).Close()
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		<-done
+		t.Fatal("nested procman did not exit")
+	}
+
+	stdoutFrames := readFrames(t, stdoutSP[0])
+	stderrFrames := readFrames(t, stderrSP[0])
+	syscall.Close(stdoutSP[0])
+	syscall.Close(stderrSP[0])
+
+	if f, ok := frameWithMessage(stdoutFrames, "hello-stdout"); !ok {
+		t.Errorf("no stdout frame for hello-stdout, got %+v", stdoutFrames)
+	} else if f.Stream != writelog.StreamStdout {
+		t.Errorf("hello-stdout frame stream: got %v, want stdout", f.Stream)
+	}
+	if f, ok := frameWithMessage(stderrFrames, "hello-stderr"); !ok {
+		t.Errorf("no stderr frame for hello-stderr, got %+v", stderrFrames)
+	} else if f.Stream != writelog.StreamStderr {
+		t.Errorf("hello-stderr frame stream: got %v, want stderr", f.Stream)
 	}
 }

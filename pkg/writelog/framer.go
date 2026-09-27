@@ -19,19 +19,43 @@ import (
 // the message text; if still too large they are silently dropped.
 const MaxFrameSize = 16384
 
+// StreamKind identifies which standard stream a framed record originated from. // This type is used to distinguish between stdout and stderr streams.
+type StreamKind uint8
+
+const (
+	// StreamUnset indicates an unset stream (no frame)
+	StreamUnset StreamKind = 0
+	// StreamStdout indicates a stream originating from stdout
+	StreamStdout StreamKind = 1
+	// StreamStderr indicates a stream originating from stderr
+	StreamStderr StreamKind = 2
+)
+
+func (s StreamKind) String() string {
+	switch s {
+	case StreamStdout:
+		return "stdout"
+	case StreamStderr:
+		return "stderr"
+	default:
+		return "unset"
+	}
+}
+
 // Frame is the wire representation of a single slog record sent over the
-// SOCK_SEQPACKET log socket (child's stdout in nested mode).
+// SOCK_SEQPACKET log socket (a child's stdout or stderr in nested mode).
 //
 // The wire format is binary — see MarshalBinary / UnmarshalBinary for the
 // on-the-wire layout.  Attrs are carried as raw JSON bytes (usually nil
 // since the only common attr, "tag", is promoted to the Tag field).
 type Frame struct {
-	Version   int      // wire version (1)
-	Level     int      // slog.Level as int
-	Tag       string   // process tag (promoted from "tag" attr)
-	Message   string   // record message
-	Groups    []string // handler group path
-	AttrsJSON []byte   // raw JSON object "{...}", nil when empty
+	Version   int        // wire version (1)
+	Level     int        // slog.Level as int
+	Tag       string     // process tag (promoted from "tag" attr)
+	Stream    StreamKind // originating standard stream (stdout/stderr)
+	Message   string     // record message
+	Groups    []string   // handler group path
+	AttrsJSON []byte     // raw JSON object "{...}", nil when empty
 }
 
 // --- Binary wire format ---
@@ -54,6 +78,12 @@ const (
 	frameFlagHasTag    byte = 0x01
 	frameFlagHasGroups byte = 0x02
 	frameFlagHasAttrs  byte = 0x04
+
+	// The originating stream is packed into flags bits 3-4 (0=unset,
+	// 1=stdout, 2=stderr), so no extra header bytes or optional section
+	// are needed and frames without the bits decode as StreamUnset.
+	frameStreamShift      = 3
+	frameStreamMask  byte = 0x18
 
 	frameHeaderSize = 8 // ver(1) + flags(1) + level(4) + msglen(2)
 )
@@ -98,6 +128,7 @@ func (f *Frame) MarshalBinary() ([]byte, error) {
 	if len(f.AttrsJSON) > 0 {
 		flags |= frameFlagHasAttrs
 	}
+	flags |= byte(f.Stream&0x3) << frameStreamShift
 	buf = append(buf, flags)
 
 	var lvl [4]byte
@@ -153,6 +184,7 @@ func (f *Frame) UnmarshalBinary(data []byte) error {
 	f.Version = int(ver)
 
 	flags := data[1]
+	f.Stream = StreamKind((flags & frameStreamMask) >> frameStreamShift)
 	f.Level = int(binary.LittleEndian.Uint32(data[2:6]))
 
 	msglen := int(binary.LittleEndian.Uint16(data[6:8]))
@@ -284,40 +316,44 @@ func ReadFrame(recv *os.File) (f Frame, ok bool, err error) {
 // writes it to a SOCK_SEQPACKET send socket. It implements the levelSetter
 // interface for per-process log level overrides.
 type FramerHandler struct {
-	sendFd    int              // raw socket fd (non-blocking SEQPACKET)
-	groupPath []string         // accumulated from WithGroup
-	attrs     []slog.Attr      // accumulated from WithAttrs
-	level     slog.Leveler     // base threshold
-	override  slog.Leveler     // per-group threshold override (via WithOverride)
-	drops     int64            // total dropped frames (O_NONBLOCK full)
+	sendFd    int          // raw socket fd (non-blocking SEQPACKET)
+	stream    StreamKind   // stream stamp applied to every frame
+	groupPath []string     // accumulated from WithGroup
+	attrs     []slog.Attr  // accumulated from WithAttrs
+	level     slog.Leveler // base threshold
+	override  slog.Leveler // per-group threshold override (via WithOverride)
+	drops     int64        // total dropped frames (O_NONBLOCK full)
 	mu        sync.Mutex
 }
 
 // NewFramer returns a FramerHandler that writes frames to the given send
-// socket fd (a non-blocking SOCK_SEQPACKET send socket). The caller is
+// socket fd (a non-blocking SOCK_SEQPACKET send socket).  stream stamps
+// every emitted frame with its originating standard stream.  The caller is
 // responsible for closing the fd after the formation exits.  level is the
 // minimum level to emit (use slog.LevelInfo for default).
-func NewFramer(sendFd int, level slog.Leveler) *FramerHandler {
+func NewFramer(sendFd int, stream StreamKind, level slog.Leveler) *FramerHandler {
 	if level == nil {
 		level = slog.LevelInfo
 	}
 	return &FramerHandler{
 		sendFd: sendFd,
-		level:  level,
+		stream: stream,
 	}
 }
 
 func (h *FramerHandler) clone() *FramerHandler {
 	h2 := &FramerHandler{
-		sendFd:   h.sendFd,
+		sendFd:    h.sendFd,
+		stream:    h.stream,
 		groupPath: append([]string(nil), h.groupPath...),
-		attrs:    append([]slog.Attr(nil), h.attrs...),
-		level:    h.level,
-		override: h.override,
+		attrs:     append([]slog.Attr(nil), h.attrs...),
+		level:     h.level,
+		override:  h.override,
 	}
 	return h2
 }
 
+// Enabled determines if the handler is enabled for the given slog.Level.
 func (h *FramerHandler) Enabled(_ context.Context, l slog.Level) bool {
 	if len(h.groupPath) == 0 {
 		// Root un-grouped handler: always enabled (slog may probe it,
@@ -332,10 +368,12 @@ func (h *FramerHandler) Enabled(_ context.Context, l slog.Level) bool {
 	return l >= threshold
 }
 
+// Handle processes the record: encodes it as a Frame and writes it to the send socket.
 func (h *FramerHandler) Handle(_ context.Context, rec slog.Record) error {
 	f := Frame{
 		Version: frameVersion,
 		Level:   int(rec.Level),
+		Stream:  h.stream,
 		Message: rec.Message,
 		Groups:  h.groupPath,
 	}
@@ -470,12 +508,14 @@ func isEAGAIN(err error) bool {
 	return false
 }
 
+// WithAttrs implements the slog.Handler interface.
 func (h *FramerHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	h2 := h.clone()
 	h2.attrs = append(h2.attrs, attrs...)
 	return h2
 }
 
+// WithGroup implements the slog.Handler interface.
 func (h *FramerHandler) WithGroup(name string) slog.Handler {
 	h2 := h.clone()
 	h2.groupPath = append(h2.groupPath, name)

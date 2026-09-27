@@ -6,12 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
-	"sync"
 	"syscall"
 	"time"
 
@@ -33,21 +31,42 @@ type Process struct {
 	CmdArgs []string
 	// Working directory
 	Workdir string
-	// LogLevel overrides the default log level for a process.
+	// LogLevel is an explicit per-process level override.  A non-zero value
+	// wins over Formation.LogLevels; the zero value (slog.LevelInfo) means
+	// "unset" and defers to the formation's default/tag override.
 	LogLevel slog.Level
+}
+
+// LogSink is the formation's output destination.  It provides the logger for
+// the formation's own records and vends per-child log descriptors so process
+// stdout/stderr can be captured without the formation knowing the transport
+// (terminal rendering, nested framing, ...).  termhandler.TermHandler
+// implements it.
+type LogSink interface {
+	// Logger returns the sink for the formation's own lifecycle records.
+	Logger() *slog.Logger
+	// ChildFDs returns the child-side stdout and stderr descriptors for a
+	// process; the caller owns and closes them after the process exits.
+	ChildFDs(tag string, index int, level slog.Level) (stdout, stderr *os.File, err error)
 }
 
 // Formation is the set of process from a procfile.
 type Formation struct {
 	Workdir   string
 	Processes []*Process
-	Sink      *slog.Logger
+	// Logs is the output facade.  When nil, child output falls back to the
+	// writelog text pipeline into slog.Default().
+	Logs LogSink
+	// LogLevels sets the default log level and per-tag overrides for process
+	// output.  An explicit Process.LogLevel wins; otherwise the tag override,
+	// then Default.  The zero value leaves output at the sink's own level
+	// (Default=Info, no overrides).
+	LogLevels LogLevels
 }
 
+// New parses a new procfile formatted specification.
 func New(fpath string) (*Formation, error) {
-	f := &Formation{
-		Sink: slog.Default(),
-	}
+	f := &Formation{}
 	if err := f.LoadFile(fpath); err != nil {
 		return nil, err
 	}
@@ -55,6 +74,7 @@ func New(fpath string) (*Formation, error) {
 	return f, nil
 }
 
+// LoadFile loads a procfile.
 func (l *Formation) LoadFile(fpath string) error {
 	if fpath == "" {
 		return nil
@@ -66,7 +86,6 @@ func (l *Formation) LoadFile(fpath string) error {
 	}
 
 	l.Workdir, _ = filepath.Abs(path.Dir(fpath))
-
 	if l.Workdir != "" {
 		slog.Debug("using workdir", "workdir", l.Workdir)
 	}
@@ -74,6 +93,7 @@ func (l *Formation) LoadFile(fpath string) error {
 	return l.Load(src)
 }
 
+// Load loads a procfile from a reader.
 func (l *Formation) Load(src io.ReadCloser) error {
 	records, err := procfile.Parse(src)
 	if err != nil {
@@ -102,11 +122,47 @@ func (l *Formation) Load(src io.ReadCloser) error {
 	return nil
 }
 
+// logLevel returns the effective level for p: an explicit Process.LogLevel
+// wins; otherwise the formation's tag override or default applies.
+func (p *Process) logLevel(levels LogLevels) slog.Level {
+	if p.LogLevel != 0 {
+		return p.LogLevel
+	}
+	return levels.For(p.Tag)
+}
+
+// applies reports whether levels overrides anything for p (i.e. the formation
+// carries an explicit policy rather than the zero value).
+func (levels LogLevels) applies(p *Process) bool {
+	if p.LogLevel != 0 {
+		return true
+	}
+	if _, ok := levels.Tags[p.Tag]; ok {
+		return true
+	}
+	return levels.Default != 0
+}
+
 // levelSetter is implemented by slog.Handlers that can produce per-group
-// handlers with an overridden minimum log level (e.g. termhandler.TermHandler).
-// It is matched structurally to avoid a hard package dependency.
+// handlers with an overridden minimum log level (e.g. termhandler's renderer
+// and writelog.FramerHandler).  It is matched structurally to avoid a hard
+// package dependency.
 type levelSetter interface {
 	WithOverride(name string, lvl slog.Leveler) slog.Handler
+}
+
+// loggerFor returns base with p's effective level applied as a per-group
+// override, when the formation has a level policy and the handler supports it.
+// It backs the writelog fallback used when Formation.Logs is nil; the LogSink
+// path receives the level directly through ChildFDs.
+func (p *Process) loggerFor(base *slog.Logger, levels LogLevels) *slog.Logger {
+	if base == nil || !levels.applies(p) {
+		return base
+	}
+	if ls, ok := base.Handler().(levelSetter); ok {
+		return slog.New(ls.WithOverride(p.Tag, p.logLevel(levels)))
+	}
+	return base
 }
 
 // validTag reports whether tag conforms to the enforced naming convention:
@@ -138,118 +194,71 @@ func validTag(tag string) bool {
 // process was torn down rather than exiting of its own accord, and Run
 // returns nil.
 //
-// Nested (child) formations detect their parent by probing stdout (fd 1):
-// if it is a SOCK_SEQPACKET socket, the formation's sink is replaced by a
-// framer that encodes each record as a structured binary frame and sends it
-// up the socket.  Otherwise the formation runs in root mode with its own
-// sink.
+// Child stdout/stderr are captured through the formation's Logs facade (e.g.
+// termhandler.TermHandler), which owns the transport and detects whether the
+// process is nested inside a parent formation.  When Logs is nil, output goes
+// through the writelog text pipeline into slog.Default().
 func (l *Formation) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	eg, ctx := errgroup.WithContext(ctx)
 
-	// --------------------------------------------------------------------
-	// 1. Nesting detection: probe stdout (fd 1). If stdout is a
-	//    SOCK_SEQPACKET socket (parent formation), replace the sink with
-	//    a framer that writes binary frames to fd 1.
-	// --------------------------------------------------------------------
-	if childFramer := writelog.NewChildFramer(); childFramer != nil {
-		l.Sink = childFramer
+	base := slog.Default()
+	if l.Logs != nil {
+		base = l.Logs.Logger()
 	}
+	procmanLog := base.WithGroup("procman")
 
-	// --------------------------------------------------------------------
-	// 2. Create one SOCK_SEQPACKET socketpair per child. The send side
-	//    becomes the child's stdout; the recv side stays in this process
-	//    and is read by a DualRelay dispatcher that handles both frames
-	//    (procman children) and text (regular binaries).
-	// --------------------------------------------------------------------
-	type childChan struct {
-		recvConn *net.UnixConn
-		sendFile *os.File // send side of the socketpair → child's stdout
-		tag      string
+	// Create one child channel per process per stream.  The LogSink owns the
+	// transport: it may render text to a terminal or frame records up to a
+	// parent formation.  Without a LogSink, process output falls back to the
+	// writelog text pipeline in Process.run.
+	type childIO struct {
+		stdout *os.File
+		stderr *os.File
 	}
-	var chans []childChan
-
-	for _, p := range l.Processes {
-		fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
-		if err != nil {
-			return fmt.Errorf("stdout socketpair for %s: %w", p.Tag, err)
-		}
-		// The send side is left blocking intentionally: non-procman children
-		// expect a blocking stdout.  Procman children self-set O_NONBLOCK
-		// after detecting the socket type via SO_TYPE.
-		recvConn := writelog.SetupRecvConn(fds[0])
-		if recvConn == nil {
-			syscall.Close(fds[0])
-			syscall.Close(fds[1])
-			return fmt.Errorf("SetupRecvConn for %s failed", p.Tag)
-		}
-		chans = append(chans, childChan{
-			recvConn: recvConn,
-			sendFile: os.NewFile(uintptr(fds[1]), fmt.Sprintf("stdout-%s", p.Tag)),
-			tag:      p.Tag,
-		})
-	}
-
-	// --------------------------------------------------------------------
-	// 3. Launch one DualRelay goroutine per child socket. Each relay reads
-	//    messages from the recv side and dispatches to either the structured
-	//    frame path or the text-splitting path based on the message header.
-	// --------------------------------------------------------------------
-	var relayWg sync.WaitGroup
-	for _, ch := range chans {
-		writelog.DualRelay(ch.recvConn, l.Sink, ch.tag, &relayWg)
-	}
-
-	// --------------------------------------------------------------------
-	// 4. Spawn child processes in the errgroup. Each child's stdout is the
-	//    send side of its socketpair (fd 1).  Stderr goes through the
-	//    regular writelog.Stream text pipeline.
-	// --------------------------------------------------------------------
-	for i, p := range l.Processes {
-		ch := chans[i]
-		// Give each process its own logger. When the sink's handler supports
-		// per-group overrides and the process carries a non-zero LogLevel,
-		// filter this process's output at that level; otherwise the process
-		// inherits the handler's global level. A zero-value LogLevel
-		// (slog.LevelInfo) means "no override".
-		procLogger := l.Sink
-		if p.LogLevel != 0 {
-			if ls, ok := l.Sink.Handler().(levelSetter); ok {
-				procLogger = slog.New(ls.WithOverride(p.Tag, p.LogLevel))
+	ios := make([]childIO, len(l.Processes))
+	if l.Logs != nil {
+		for i, p := range l.Processes {
+			stdout, stderr, err := l.Logs.ChildFDs(p.Tag, p.Index, p.logLevel(l.LogLevels))
+			if err != nil {
+				for j := range i {
+					ios[j].stdout.Close()
+					ios[j].stderr.Close()
+				}
+				return err
 			}
+			ios[i] = childIO{stdout: stdout, stderr: stderr}
 		}
+	}
+
+	for i, p := range l.Processes {
+		ch := ios[i]
 		p := p
 		eg.Go(func() error {
-			defer ch.sendFile.Close()
-			logger := l.Sink.WithGroup("procman")
-			logger.Warn(fmt.Sprintf("starting %s", p.Tag))
-			err := p.run(ctx, withLogger(procLogger), withStdoutFile(ch.sendFile))
+			if l.Logs != nil {
+				defer ch.stdout.Close()
+				defer ch.stderr.Close()
+			}
+			procmanLog.Warn(fmt.Sprintf("starting %s", p.Tag))
+			logger := base
+			if l.Logs == nil {
+				logger = p.loggerFor(base, l.LogLevels)
+			}
+			err := p.run(ctx,
+				withStdoutFile(ch.stdout),
+				withStderrFile(ch.stderr),
+				withLogger(logger),
+			)
 			if err != nil {
-				logger.Warn(err.Error())
+				procmanLog.Warn(err.Error())
 			}
 			return err
 		})
 	}
 
-	err := eg.Wait()
-
-	// --------------------------------------------------------------------
-	// 5. Signal all relays to stop by setting a past deadline on their
-	//    recv sockets (unblocking the reader). Close the recv sockets and
-	//    wait for the relay goroutines to finish.
-	// --------------------------------------------------------------------
-	stopTime := time.Now().Add(-1 * time.Second)
-	for _, ch := range chans {
-		ch.recvConn.SetReadDeadline(stopTime)
-	}
-	for _, ch := range chans {
-		ch.recvConn.Close()
-	}
-	relayWg.Wait()
-
-	return err
+	return eg.Wait()
 }
 
 type runOptions struct {
@@ -257,6 +266,7 @@ type runOptions struct {
 	extraFiles []*os.File
 	envAdd     []string
 	stdoutFile *os.File // when set, used as the child's stdout (instead of writelog.Stream)
+	stderrFile *os.File // when set, used as the child's stderr (instead of writelog.Stream)
 }
 
 func (ro *runOptions) Apply(os ...runOption) {
@@ -318,6 +328,12 @@ func withStdoutFile(f *os.File) runOption {
 	}
 }
 
+func withStderrFile(f *os.File) runOption {
+	return func(o *runOptions) {
+		o.stderrFile = f
+	}
+}
+
 func (p *Process) run(ctx context.Context, opt ...runOption) error {
 	o := &runOptions{
 		logger: slog.Default(),
@@ -334,26 +350,33 @@ func (p *Process) run(ctx context.Context, opt ...runOption) error {
 	}
 
 	c := exec.CommandContext(ctx, p.CmdArgs[0], p.CmdArgs[1:]...)
-	// Process output is logged.  Stdout, when a stdoutFile is provided
-	// (socketpair from Formation.Run), is wired directly so procman children
-	// can use the framer and non-procman children write text into the socket
-	// for the DualRelay to dispatch.  Stderr always goes through the regular
-	// writelog.Stream text pipeline.
-	stderr := writelog.Stream(o.logger, p.Tag, slog.LevelInfo, writelog.StreamConfig{})
-	defer stderr.Close()
+	// Detach the child from the controlling terminal.  Stdin is the null
+	// device (never the terminal), and Setsid gives the child its own session
+	// and process group so terminal-generated signals (SIGINT from Ctrl-C,
+	// SIGTSTP, SIGQUIT) only ever reach procman, which decides when to tear
+	// the group down via Cancel.  The group kill still works because a session
+	// leader's pgid is its own pid.
 	c.Stdin = nil
+
+	// Process output is logged.  When a stdout/stderr socket is provided
+	// (Formation.Run through a LogSink), the fds are wired directly so procman
+	// children can use their framers and non-procman children write text into
+	// the socket for the relay to dispatch.  Without one, output goes through
+	// the regular writelog.Stream text pipeline.
 	if o.stdoutFile != nil {
-		// The send side of a SOCK_SEQPACKET socketpair — child's stdout
-		// is a socket, not a pipe.  DualRelay on the recv side handles
-		// both binary frames (procman children) and plain text.
 		c.Stdout = o.stdoutFile
 	} else {
-		// Root-mode or direct Process.run caller: text pipe (legacy path).
 		stdout := writelog.Stream(o.logger, p.Tag, slog.LevelInfo, writelog.StreamConfig{})
 		defer stdout.Close()
 		c.Stdout = stdout
 	}
-	c.Stderr = stderr
+	if o.stderrFile != nil {
+		c.Stderr = o.stderrFile
+	} else {
+		stderr := writelog.Stream(o.logger, p.Tag, slog.LevelInfo, writelog.StreamConfig{})
+		defer stderr.Close()
+		c.Stderr = stderr
+	}
 	c.WaitDelay = 1 * time.Second
 	c.Dir = p.Workdir
 	c.ExtraFiles = o.extraFiles
@@ -381,7 +404,9 @@ func (p *Process) run(ctx context.Context, opt ...runOption) error {
 		return err
 	}
 	c.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
+		// New session + group: detaches the controlling terminal and keeps
+		// the group-wide kill in Cancel working (pgid == child pid).
+		Setsid: true,
 	}
 
 	slog.Debug("c.run", "c.args", p.CmdArgs)
@@ -438,6 +463,7 @@ func pf(tag string, err error) error {
 	return fmt.Errorf("%s: %w", tag, err)
 }
 
+// Exec calls os.exec, replacing this process.
 func (p *Process) Exec(ctx context.Context, opt ...runOption) error {
 	if len(p.CmdArgs) == 0 {
 		return fmt.Errorf("%s: no command", p.Tag)

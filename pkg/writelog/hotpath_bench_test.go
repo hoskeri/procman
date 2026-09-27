@@ -27,7 +27,8 @@ func (cheapSink) WithGroup(string) slog.Handler             { return cheapSink{}
 // /dev/null. This measures the exact path used when --output auto|term.
 func newTermSink() slog.Handler {
 	devNull, _ := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-	return termhandler.New(devNull, &termhandler.Options{Colors: true, Columns: 0})
+	th := termhandler.New(context.Background(), nil, devNull, devNull, &termhandler.Options{Colors: true, Columns: 0})
+	return th.Logger().Handler()
 }
 
 var line = []byte("2026-09-13 12:00:00 web | info: processing batch=42 item=a-long-payload-here-987\n")
@@ -48,8 +49,8 @@ func BenchmarkWritelogCheapSink(b *testing.B) {
 // concat, truncation, mutex, single Write syscall) per line.
 func BenchmarkTermhandlerHandle(b *testing.B) {
 	devNull, _ := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-	h := termhandler.New(devNull, &termhandler.Options{Colors: true, Columns: 0})
-	hg := h.WithGroup("web").(slog.Handler)
+	th := termhandler.New(context.Background(), nil, devNull, devNull, &termhandler.Options{Colors: true, Columns: 0})
+	hg := th.Logger().WithGroup("web").Handler()
 	rec := slog.NewRecord(time.Now(), slog.LevelInfo, string(line[:len(line)-1]), 0)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(line)))
@@ -62,8 +63,8 @@ func BenchmarkTermhandlerHandle(b *testing.B) {
 // -> color termhandler -> /dev/null. This is what trebuchet exercises.
 func BenchmarkTermPathModern(b *testing.B) {
 	devNull, _ := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-	h := termhandler.New(devNull, &termhandler.Options{Colors: true, Columns: 0})
-	lg := slog.New(h)
+	th := termhandler.New(context.Background(), nil, devNull, devNull, &termhandler.Options{Colors: true, Columns: 0})
+	lg := th.Logger()
 	s := writelog.Stream(lg, "web", slog.LevelInfo, writelog.StreamConfig{})
 	defer s.Close()
 	b.ReportAllocs()
@@ -80,8 +81,8 @@ func BenchmarkTermPathModern(b *testing.B) {
 func BenchmarkContention(b *testing.B) {
 	const nproc = 16
 	devNull, _ := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-	h := termhandler.New(devNull, &termhandler.Options{Colors: true, Columns: 0})
-	lg := slog.New(h)
+	th := termhandler.New(context.Background(), nil, devNull, devNull, &termhandler.Options{Colors: true, Columns: 0})
+	lg := th.Logger()
 
 	streams := make([]struct {
 		s  interface{ Write([]byte) (int, error) }

@@ -3,19 +3,21 @@ package termhandler
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
 
-// newTestHandler returns a TermHandler writing into a buffer, so tests don't
-// need a real *os.File (New requires one for terminal detection).
-func newTestHandler(global slog.Level) (*TermHandler, *bytes.Buffer) {
+// newTestRenderer returns a renderer writing into a buffer, so tests don't
+// need a real *os.File (terminal detection is skipped).
+func newTestRenderer(global slog.Level) (*renderer, *bytes.Buffer) {
 	buf := &bytes.Buffer{}
-	return &TermHandler{
+	return &renderer{
 		out:     buf,
 		mu:      &sync.Mutex{},
 		palette: fgcolors,
@@ -26,11 +28,11 @@ func newTestHandler(global slog.Level) (*TermHandler, *bytes.Buffer) {
 // TestPerGroupLevelOverride verifies that WithOverride only affects the named
 // group while other groups inherit the global Options.Level.
 func TestPerGroupLevelOverride(t *testing.T) {
-	th, buf := newTestHandler(slog.LevelInfo)
+	th, buf := newTestRenderer(slog.LevelInfo)
 
 	// Only the "quiet" group is overridden up; "web" inherits the global Info.
 	web := slog.New(th.WithGroup("web"))
-	quiet := slog.New(th.WithGroup("quiet").(*TermHandler).WithOverride("quiet", slog.LevelError))
+	quiet := slog.New(th.WithGroup("quiet").(*renderer).WithOverride("quiet", slog.LevelError))
 
 	web.Info("web info")       // Info >= Info (global) -> logged
 	web.Error("web error")     // logged
@@ -53,9 +55,9 @@ func TestPerGroupLevelOverride(t *testing.T) {
 // TestPerGroupLevelOverrideDown verifies a per-group override can also lower
 // the threshold below the global level, restoring verbose output.
 func TestPerGroupLevelOverrideDown(t *testing.T) {
-	th, buf := newTestHandler(slog.LevelWarn)
+	th, buf := newTestRenderer(slog.LevelWarn)
 
-	verbose := slog.New(th.WithGroup("verbose").(*TermHandler).WithOverride("verbose", slog.LevelDebug))
+	verbose := slog.New(th.WithGroup("verbose").(*renderer).WithOverride("verbose", slog.LevelDebug))
 	verbose.Info("verbose info") // Info >= Debug (override) -> shown despite global Warn
 
 	if !strings.Contains(buf.String(), "verbose info") {
@@ -75,7 +77,7 @@ func TestPerGroupLevelOverrideDown(t *testing.T) {
 // WithGroup/WithAttrs wrapping that writelog applies on top of the
 // per-process logger, and that the root handler is left untouched.
 func TestOverrideSurvivesReGroup(t *testing.T) {
-	th, buf := newTestHandler(slog.LevelInfo)
+	th, buf := newTestRenderer(slog.LevelInfo)
 
 	// Simulate Formation.Run + writelog: build the per-process logger, then
 	// re-group it the way writelog.Stream does.
@@ -106,7 +108,7 @@ func TestOverrideSurvivesReGroup(t *testing.T) {
 // to at most Columns visible bytes (ANSI escapes occupy no columns) before it
 // reaches the output writer.
 func TestColumnsTruncation(t *testing.T) {
-	th, buf := newTestHandler(slog.LevelInfo)
+	th, buf := newTestRenderer(slog.LevelInfo)
 	th.opts.Columns = 8
 
 	rec := slog.NewRecord(time.Time{}, slog.LevelInfo, strings.Repeat("a", 11), 0)
@@ -126,7 +128,7 @@ func TestColumnsTruncation(t *testing.T) {
 // budget — a naive byte-counting truncator would cut inside the prefix and
 // drop every payload byte.
 func TestColumnsTruncationAnsi(t *testing.T) {
-	th, buf := newTestHandler(slog.LevelInfo)
+	th, buf := newTestRenderer(slog.LevelInfo)
 	th.opts.Colors = true
 	th.opts.Columns = 21
 	th.groupPath = []string{"web"}
@@ -146,6 +148,113 @@ func TestColumnsTruncationAnsi(t *testing.T) {
 	}
 }
 
+// TestChildFDsStandaloneText verifies the full facade wiring without a parent
+// formation: ChildFDs returns SOCK_SEQPACKET child descriptors, and text
+// written to them (a non-procman child) is relayed to the matching root sink
+// with the stream kept separate.
+func TestChildFDsStandaloneText(t *testing.T) {
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdoutR.Close()
+	defer stderrR.Close()
+
+	th := New(context.Background(), nil, stdoutW, stderrW, &Options{Plain: true})
+	outFD, errFD, err := th.ChildFDs("web", 0, 0)
+	if err != nil {
+		t.Fatalf("ChildFDs: %v", err)
+	}
+
+	// The child ends must be SEQPACKET sockets so a nested procman detects
+	// them, and non-procman text can flow through the relay.
+	if typ, err := syscall.GetsockoptInt(int(outFD.Fd()), syscall.SOL_SOCKET, syscall.SO_TYPE); err != nil || typ != syscall.SOCK_SEQPACKET {
+		t.Errorf("child stdout fd: got type %d, err %v; want SOCK_SEQPACKET", typ, err)
+	}
+
+	if _, err := outFD.Write([]byte("hello-out\n")); err != nil {
+		t.Fatalf("write stdout: %v", err)
+	}
+	if _, err := errFD.Write([]byte("hello-err\n")); err != nil {
+		t.Fatalf("write stderr: %v", err)
+	}
+	outFD.Close()
+	errFD.Close()
+
+	// Close waits for both relays to drain, then close the pipe writers so the
+	// reads below see EOF.
+	th.Close()
+	th.Close() // idempotent
+	stdoutW.Close()
+	stderrW.Close()
+
+	out, _ := io.ReadAll(stdoutR)
+	errOut, _ := io.ReadAll(stderrR)
+	if !strings.Contains(string(out), "hello-out") {
+		t.Errorf("stdout sink missing hello-out, got %q", out)
+	}
+	if strings.Contains(string(out), "hello-err") {
+		t.Errorf("stdout sink leaked stderr text: %q", out)
+	}
+	if !strings.Contains(string(errOut), "hello-err") {
+		t.Errorf("stderr sink missing hello-err, got %q", errOut)
+	}
+}
+
+// TestChildFDsLevelOverride verifies that a per-process level passed to
+// ChildFDs is applied to the relayed records.
+func TestChildFDsLevelOverride(t *testing.T) {
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdoutR.Close()
+
+	th := New(context.Background(), nil, stdoutW, stdoutW, &Options{})
+	outFD, errFD, err := th.ChildFDs("web", 0, slog.LevelError)
+	if err != nil {
+		t.Fatalf("ChildFDs: %v", err)
+	}
+	outFD.Write([]byte("suppressed-info\n"))
+	errFD.Close()
+	outFD.Close()
+
+	th.Close()
+	stdoutW.Close()
+	out, _ := io.ReadAll(stdoutR)
+	if strings.Contains(string(out), "suppressed-info") {
+		t.Errorf("Info text should be suppressed by the Error override, got %q", out)
+	}
+}
+
+// TestChildFDsCloseRace exercises ChildFDs concurrently with Close, guarding
+// the wg.Add/wg.Wait ordering and the closed flag.  Run with -race.
+func TestChildFDsCloseRace(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		th := New(context.Background(), nil, nil, nil, &Options{Plain: true})
+		var wg sync.WaitGroup
+		for j := 0; j < 8; j++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				out, errOut, err := th.ChildFDs("web", 0, 0)
+				if err != nil {
+					return
+				}
+				out.Close()
+				errOut.Close()
+			}()
+		}
+		go th.Close()
+		wg.Wait()
+		th.Close()
+	}
+}
+
 // TestNewColorsForced verifies that Options.Colors=true forces color even on a
 // non-terminal (so --output term works on piped stdout), while the default
 // auto-detects (color off for a pipe).
@@ -158,17 +267,47 @@ func TestNewColorsForced(t *testing.T) {
 	defer r.Close()
 	defer w.Close()
 
-	if !New(w, &Options{Colors: true}).opts.Colors {
+	if !newRenderer(w, Options{Colors: true}).opts.Colors {
 		t.Error("Options.Colors=true should force color even when not a terminal")
 	}
-	if New(w, &Options{}).opts.Colors {
+	if newRenderer(w, Options{}).opts.Colors {
 		t.Error("non-terminal without forced color should not enable color")
 	}
-	if New(w, &Options{}).opts.Columns != 0 {
+	if newRenderer(w, Options{}).opts.Columns != 0 {
 		t.Error("Options.Columns should default to 0 for non-terminal output (truncation off)")
 	}
-	if New(w, &Options{Columns: -1}).opts.Columns != -1 {
+	if newRenderer(w, Options{Columns: -1}).opts.Columns != -1 {
 		t.Error("negative Options.Columns should be preserved (truncation disabled)")
+	}
+}
+
+// TestPlainMode verifies that Options.Plain selects a TextHandler renderer
+// (no colored prefixes) and that it renders ungrouped records, unlike the
+// term renderer (whose Enabled drops records without a group).
+func TestPlainMode(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer r.Close()
+
+	th := New(context.Background(), nil, w, w, &Options{Plain: true})
+	defer th.Close()
+	if th.Nested() {
+		t.Fatal("expected root (non-nested) mode with a pipe stdout")
+	}
+	th.Logger().Info("hello-plain")
+	w.Close()
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read pipe: %v", err)
+	}
+	if !strings.Contains(string(out), "hello-plain") {
+		t.Errorf("plain mode should render ungrouped records, got %q", out)
+	}
+	if strings.Contains(string(out), " | ") {
+		t.Errorf("plain mode should not add the term prefix, got %q", out)
 	}
 }
 
@@ -198,9 +337,9 @@ func TestColorSupport(t *testing.T) {
 	}()
 
 	tests := []struct {
-		ct    string
-		term  string
-		want  int
+		ct   string
+		term string
+		want int
 	}{
 		{"", "", 0},
 		{"", "xterm", 0},
@@ -275,9 +414,9 @@ func TestNoEchoUntaintedPipe(t *testing.T) {
 
 func TestShortenMiddle(t *testing.T) {
 	tests := []struct {
-		input   string
-		maxLen  int
-		want    string
+		input  string
+		maxLen int
+		want   string
 	}{
 		{"web", 16, "web"},
 		{"node-1/kubelet", 16, "node-1/kubelet"},

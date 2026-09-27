@@ -2,9 +2,12 @@ package process
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -45,11 +48,12 @@ func TestPerProcessLogLevelOverride(t *testing.T) {
 	}
 	defer logFile.Close()
 
-	th := termhandler.New(logFile, &termhandler.Options{Level: slog.LevelInfo})
-	lg := slog.New(th)
+	ctx := context.Background()
+	th := termhandler.New(ctx, nil, logFile, logFile, &termhandler.Options{Level: slog.LevelInfo})
+	defer th.Close()
 
 	frm := &Formation{
-		Sink: lg,
+		Logs: th,
 		Processes: []*Process{
 			{Tag: "web", CmdArgs: []string{"/bin/sh", "-c", "echo web-message"}},
 			// quiet delays so web deterministically echoes and exits first:
@@ -65,6 +69,7 @@ func TestPerProcessLogLevelOverride(t *testing.T) {
 	// Processes exit cleanly, so Formation.Run returns a non-nil error by
 	// design (any process exit cancels the group); the output is what matters.
 	_ = frm.Run(context.Background())
+	th.Close() // drain relay output before reading the file
 
 	data, err := os.ReadFile(logFile.Name())
 	if err != nil {
@@ -81,16 +86,73 @@ func TestPerProcessLogLevelOverride(t *testing.T) {
 	}
 }
 
+// TestLogLevelsFallback verifies the per-process level policy is applied on
+// the writelog fallback path (Formation.Logs == nil) through a levelSetter
+// handler, not just through ChildFDs.
+func TestLogLevelsFallback(t *testing.T) {
+	logFile, err := os.CreateTemp(t.TempDir(), "procman-loglevels-*.log")
+	if err != nil {
+		t.Fatalf("create temp log file: %v", err)
+	}
+	defer logFile.Close()
+
+	th := termhandler.New(context.Background(), nil, logFile, logFile, &termhandler.Options{Level: slog.LevelInfo})
+	defer th.Close()
+	base := th.Logger()
+
+	// Explicit Process.LogLevel -> Error override.
+	quiet := (&Process{Tag: "quiet", LogLevel: slog.LevelError}).loggerFor(base, LogLevels{})
+	quiet.WithGroup("quiet").Info("quiet-info")   // suppressed
+	quiet.WithGroup("quiet").Error("quiet-error") // shown
+
+	// No policy: the base logger is returned untouched.
+	web := (&Process{Tag: "web"}).loggerFor(base, LogLevels{})
+	web.WithGroup("web").Info("web-info") // shown
+
+	data, err := os.ReadFile(logFile.Name())
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+	out := string(data)
+	if strings.Contains(out, "quiet-info") {
+		t.Errorf("expected quiet info suppressed by explicit Error override, got:\n%s", out)
+	}
+	for _, want := range []string{"quiet-error", "web-info"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in fallback output, got:\n%s", want, out)
+		}
+	}
+}
+
 // discardLogger is a sink that swallows all process output.
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// discardSink is a LogSink that swallows all output and wires child streams to
+// /dev/null.
+type discardSink struct{}
+
+func (discardSink) Logger() *slog.Logger { return discardLogger() }
+
+func (discardSink) ChildFDs(tag string, index int, level slog.Level) (*os.File, *os.File, error) {
+	stdout, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	stderr, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		stdout.Close()
+		return nil, nil, err
+	}
+	return stdout, stderr, nil
 }
 
 // TestSelfExitCode: the first process to exit on its own brings the formation
 // down and its exit code is reported.
 func TestSelfExitCode(t *testing.T) {
 	frm := &Formation{
-		Sink: discardLogger(),
+		Logs: discardSink{},
 		Processes: []*Process{
 			{Tag: "web", CmdArgs: []string{"/bin/sh", "-c", "exit 3"}},
 			{Tag: "worker", CmdArgs: []string{"/bin/sh", "-c", "sleep 30"}},
@@ -110,7 +172,7 @@ func TestSelfExitCode(t *testing.T) {
 // formation down, but carries status 0.
 func TestCleanSelfExitCode(t *testing.T) {
 	frm := &Formation{
-		Sink:      discardLogger(),
+		Logs:      discardSink{},
 		Processes: []*Process{{Tag: "web", CmdArgs: []string{"/bin/sh", "-c", "true"}}},
 	}
 	err := frm.Run(context.Background())
@@ -127,7 +189,7 @@ func TestCleanSelfExitCode(t *testing.T) {
 // its exit code in the 128+signum convention (SIGTERM -> 143).
 func TestSignalSelfExitCode(t *testing.T) {
 	frm := &Formation{
-		Sink:      discardLogger(),
+		Logs:      discardSink{},
 		Processes: []*Process{{Tag: "web", CmdArgs: []string{"/bin/sh", "-c", "kill -TERM $$"}}},
 	}
 	err := frm.Run(context.Background())
@@ -145,7 +207,7 @@ func TestSignalSelfExitCode(t *testing.T) {
 func TestCancelIsSuccess(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	frm := &Formation{
-		Sink: discardLogger(),
+		Logs: discardSink{},
 		Processes: []*Process{
 			{Tag: "web", CmdArgs: []string{"/bin/sh", "-c", "sleep 30"}},
 			{Tag: "worker", CmdArgs: []string{"/bin/sh", "-c", "sleep 30"}},
@@ -166,7 +228,7 @@ func TestCancelIsSuccess(t *testing.T) {
 func TestStubbornProcessEscalatesToKill(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	frm := &Formation{
-		Sink: discardLogger(),
+		Logs: discardSink{},
 		Processes: []*Process{
 			// Busy loop that ignores SIGTERM and never forks, so nothing in
 			// the group dies until the SIGKILL escalation fires.
@@ -198,6 +260,67 @@ func TestEmptyCommandIsRejected(t *testing.T) {
 	p := &Process{Tag: "web"}
 	if err := p.run(context.Background(), withLogger(discardLogger())); err == nil {
 		t.Fatal("expected error for Process with no command")
+	}
+}
+
+// TestChildDetachedFromTerminal verifies that spawned processes get a new
+// session (no controlling terminal) and /dev/null stdin, so terminal
+// signals and keystrokes never reach them directly.
+func TestChildDetachedFromTerminal(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "child.txt")
+	script := fmt.Sprintf(
+		`echo "session=$(cut -d' ' -f6 /proc/self/stat)" > %q; `+
+			`echo "stdin=$(readlink /proc/self/fd/0)" >> %q`,
+		out, out)
+
+	frm := &Formation{
+		Logs:      discardSink{},
+		Processes: []*Process{{Tag: "web", CmdArgs: []string{"/bin/sh", "-c", script}}},
+	}
+	// The child exits on its own, so Run returns an *ExitError; ignore it.
+	_ = frm.Run(context.Background())
+
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read child report %s: %v", out, err)
+	}
+
+	var childSid int
+	var stdin string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "session":
+			childSid, _ = strconv.Atoi(v)
+		case "stdin":
+			stdin = v
+		}
+	}
+
+	myStat, err := os.ReadFile("/proc/self/stat")
+	if err != nil {
+		t.Fatalf("read own stat: %v", err)
+	}
+	myFields := strings.Fields(string(myStat))
+	if len(myFields) < 6 {
+		t.Fatalf("unexpected /proc/self/stat: %q", myStat)
+	}
+	mySid, err := strconv.Atoi(myFields[5])
+	if err != nil {
+		t.Fatalf("parse own session: %v", err)
+	}
+	if childSid == 0 {
+		t.Fatalf("could not parse child session from %q", data)
+	}
+	if childSid == mySid {
+		t.Errorf("child session %d equals procman session %d: child not detached", childSid, mySid)
+	}
+	if stdin != "/dev/null" {
+		t.Errorf("child stdin: got %q, want /dev/null", stdin)
 	}
 }
 
@@ -248,12 +371,12 @@ func TestTagValidation(t *testing.T) {
 		{"-web", "tag"},
 		{"web-", "tag"},
 		{"", "tag"},
-		{"web", ""},       // valid
-		{"web-1", ""},     // valid
-		{"node", ""},       // valid
-		{"node-1", ""},     // valid
-		{"a", ""},          // valid (single char)
-		{"0", ""},          // valid (single digit)
+		{"web", ""},    // valid
+		{"web-1", ""},  // valid
+		{"node", ""},   // valid
+		{"node-1", ""}, // valid
+		{"a", ""},      // valid (single char)
+		{"0", ""},      // valid (single digit)
 	}
 
 	for _, tt := range tests {

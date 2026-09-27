@@ -22,6 +22,7 @@ func TestFrameRoundTrip(t *testing.T) {
 		Version:   1,
 		Level:     int(slog.LevelError),
 		Tag:       "kubelet",
+		Stream:    StreamStderr,
 		Message:   "out of memory",
 		Groups:    []string{"kubelet"},
 		AttrsJSON: attrsJSON,
@@ -51,6 +52,9 @@ func TestFrameRoundTrip(t *testing.T) {
 	if got.Tag != orig.Tag {
 		t.Errorf("Tag: got %q, want %q", got.Tag, orig.Tag)
 	}
+	if got.Stream != orig.Stream {
+		t.Errorf("Stream: got %v, want %v", got.Stream, orig.Stream)
+	}
 	if got.Message != orig.Message {
 		t.Errorf("Message: got %q, want %q", got.Message, orig.Message)
 	}
@@ -66,6 +70,36 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 	if attrsMap["pid"] != float64(42) || attrsMap["signal"] != "SIGKILL" {
 		t.Errorf("Attrs: got %v", attrsMap)
+	}
+}
+
+// TestStreamRoundTrip covers the stdout/stderr discriminator across the wire,
+// including the unset default and that the stream bits coexist with the other
+// flags.
+func TestStreamRoundTrip(t *testing.T) {
+	for _, stream := range []StreamKind{StreamUnset, StreamStdout, StreamStderr} {
+		orig := Frame{
+			Version: 1,
+			Level:   int(slog.LevelInfo),
+			Tag:     "web",
+			Stream:  stream,
+			Message: "hello",
+			Groups:  []string{"web", "procman"},
+		}
+		b, err := orig.MarshalBinary()
+		if err != nil {
+			t.Fatalf("MarshalBinary(%v): %v", stream, err)
+		}
+		var got Frame
+		if err := got.UnmarshalBinary(b); err != nil {
+			t.Fatalf("UnmarshalBinary(%v): %v", stream, err)
+		}
+		if got.Stream != stream {
+			t.Errorf("Stream: got %v, want %v", got.Stream, stream)
+		}
+		if got.Message != orig.Message || got.Tag != orig.Tag || len(got.Groups) != 2 {
+			t.Errorf("stream %v clobbered other fields: %+v", stream, got)
+		}
 	}
 }
 
@@ -120,17 +154,27 @@ func TestIsFramePrefix(t *testing.T) {
 }
 
 // captureHandler implements slog.Handler by calling a function and is
-// used to collect records sent through a relay.
+// used to collect records sent through a relay.  Handler-level attrs added
+// via WithAttrs are merged into each captured record, mirroring what a real
+// rendering handler sees.
 type captureHandler struct {
-	fn func(context.Context, slog.Record) error
+	fn    func(context.Context, slog.Record) error
+	attrs []slog.Attr
 }
 
 func (h *captureHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
 func (h *captureHandler) Handle(ctx context.Context, r slog.Record) error {
+	if len(h.attrs) > 0 {
+		r.AddAttrs(h.attrs...)
+	}
 	return h.fn(ctx, r)
 }
-func (h *captureHandler) WithAttrs(_ []slog.Attr) slog.Handler   { return h }
-func (h *captureHandler) WithGroup(_ string) slog.Handler        { return h }
+func (h *captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	h2 := *h
+	h2.attrs = append(append([]slog.Attr(nil), h.attrs...), attrs...)
+	return &h2
+}
+func (h *captureHandler) WithGroup(_ string) slog.Handler { return h }
 
 // TestFramerRelayRoundTrip creates a socketpair, writes frames from a
 // FramerHandler, reads them via DualRelay, and verifies the record arrives at
@@ -140,7 +184,7 @@ func TestFramerRelayRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Send side: set non-blocking (as the child's NewChildFramer would).
+	// Send side: set non-blocking (as the child's ChildSinks would).
 	if err := syscall.SetNonblock(fds[1], true); err != nil {
 		t.Fatal(err)
 	}
@@ -162,12 +206,12 @@ func TestFramerRelayRoundTrip(t *testing.T) {
 
 	// Start DualRelay
 	var relayWg sync.WaitGroup
-	DualRelay(recvConn, recorder, "parent", &relayWg)
+	DualRelay(recvConn, recorder, "parent", StreamStdout, &relayWg)
 
 	time.Sleep(10 * time.Millisecond) // let relay goroutine start
 
 	// Use FramerHandler to write a frame
-	framer := NewFramer(sendFd, slog.LevelInfo)
+	framer := NewFramer(sendFd, StreamStdout, slog.LevelInfo)
 	framer = framer.WithGroup("child").WithAttrs([]slog.Attr{slog.Int("count", 7)}).(*FramerHandler)
 	framerLogger := slog.New(framer)
 	framerLogger.With(slog.String("tag", "child")).Warn("hello from child")
@@ -213,8 +257,8 @@ func TestDualRelayTextFallback(t *testing.T) {
 	recvConn := SetupRecvConn(fds[0])
 
 	var (
-		mu   sync.Mutex
-		got  []string
+		mu  sync.Mutex
+		got []string
 	)
 	recorder := slog.New(&captureHandler{fn: func(ctx context.Context, r slog.Record) error {
 		mu.Lock()
@@ -224,7 +268,7 @@ func TestDualRelayTextFallback(t *testing.T) {
 	}})
 
 	var relayWg sync.WaitGroup
-	DualRelay(recvConn, recorder, "child", &relayWg)
+	DualRelay(recvConn, recorder, "child", StreamStdout, &relayWg)
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -279,12 +323,12 @@ func TestDualRelayMixed(t *testing.T) {
 	}})
 
 	var relayWg sync.WaitGroup
-	DualRelay(recvConn, recorder, "mixed", &relayWg)
+	DualRelay(recvConn, recorder, "mixed", StreamStdout, &relayWg)
 
 	time.Sleep(10 * time.Millisecond)
 
 	// Write a frame (procman child style).
-	framer := NewFramer(sendFd, slog.LevelDebug)
+	framer := NewFramer(sendFd, StreamStdout, slog.LevelDebug)
 	framerLogger := slog.New(framer)
 	framerLogger.With(slog.String("tag", "proc-child")).Info("structured message")
 
@@ -315,6 +359,70 @@ func TestDualRelayMixed(t *testing.T) {
 	}
 }
 
+// attrString returns the string value of attr key in r, or "" if absent.
+func attrString(r slog.Record, key string) string {
+	v := ""
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == key {
+			v = a.Value.String()
+			return false
+		}
+		return true
+	})
+	return v
+}
+
+// TestDualRelayStreamDiscriminator verifies that a frame's own stream wins
+// over the channel it arrived on, and that text (which has no frame) takes
+// the channel's stream.
+func TestDualRelayStreamDiscriminator(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.SetNonblock(fds[1], true); err != nil {
+		t.Fatal(err)
+	}
+	sendFd := fds[1]
+	recvConn := SetupRecvConn(fds[0])
+
+	var (
+		mu  sync.Mutex
+		got []slog.Record
+	)
+	recorder := slog.New(&captureHandler{fn: func(ctx context.Context, r slog.Record) error {
+		mu.Lock()
+		got = append(got, r)
+		mu.Unlock()
+		return nil
+	}})
+
+	var relayWg sync.WaitGroup
+	// The channel is stdout, but the frame below claims stderr.
+	DualRelay(recvConn, recorder, "child", StreamStdout, &relayWg)
+	time.Sleep(10 * time.Millisecond)
+
+	framer := NewFramer(sendFd, StreamStderr, slog.LevelInfo)
+	slog.New(framer).Info("from stderr")
+	syscall.Write(sendFd, []byte("plain text\n"))
+
+	syscall.Close(sendFd)
+	relayWg.Wait()
+	recvConn.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("expected 2 records, got %d: %+v", len(got), got)
+	}
+	if s := attrString(got[0], "stream"); s != "stderr" {
+		t.Errorf("frame stream: got %q, want stderr (frame must win)", s)
+	}
+	if s := attrString(got[1], "stream"); s != "stdout" {
+		t.Errorf("text stream: got %q, want stdout (channel fallback)", s)
+	}
+}
+
 // TestFramerDrop verifies that a saturated socket buffer causes drops
 // (writes return EAGAIN and the drop counter increments).
 func TestFramerDrop(t *testing.T) {
@@ -329,7 +437,7 @@ func TestFramerDrop(t *testing.T) {
 	recvFd := fds[0]
 	defer syscall.Close(recvFd)
 
-	framer := NewFramer(sendFd, slog.LevelDebug)
+	framer := NewFramer(sendFd, StreamStdout, slog.LevelDebug)
 
 	// Fill the socket buffer with large frames. Write until EAGAIN drops occur.
 	largeMsg := strings.Repeat("X", 14000) // each frame ~14 KB
@@ -365,7 +473,7 @@ func TestRelayTeardown(t *testing.T) {
 	sink := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	var wg sync.WaitGroup
-	DualRelay(recvConn, sink, "teardown-test", &wg)
+	DualRelay(recvConn, sink, "teardown-test", StreamStdout, &wg)
 
 	time.Sleep(10 * time.Millisecond) // let it start
 

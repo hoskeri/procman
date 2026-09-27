@@ -28,7 +28,7 @@ func Parse(src io.ReadCloser) ([]Record, error) {
 
 	sc := bufio.NewScanner(src)
 	for sc.Scan() {
-		lineNum += 1
+		lineNum++
 
 		line := sc.Text()
 

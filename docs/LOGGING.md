@@ -24,24 +24,81 @@ In runkube, this manifests as:
 **Serialize structure at every process boundary; re-materialize slog records
 at the immediate parent; render human text exactly once, at the root.**
 
-## Approach: repurpose stdout as the log channel
+## Output facade (`pkg/termhandler`)
+
+`termhandler.TermHandler` is the output facade for a formation.  It is built
+with the process's standard streams and a lifetime context:
+
+```go
+logs := termhandler.New(ctx, os.Stdin, os.Stdout, os.Stderr, &termhandler.Options{...})
+defer logs.Close()
+```
+
+It owns three concerns that used to be split between `cmd/procman/main.go` and
+`Formation.Run`:
+
+1. **Root vs. nested mode.** `New` probes stdout (and stderr) for a
+   `SOCK_SEQPACKET` socket.  In root mode it renders records through the
+   colored, tag-prefixed renderer (or a plain `slog.TextHandler` when
+   `Options.Plain` is set, used by `--output auto` on a pipe).  In nested mode
+   it stamps records as binary frames and sends them up the parent's socket.
+2. **Terminal state.** In root mode it calls `NoEcho` on the first terminal
+   stream (stdin preferred) and restores the previous termios on `Close`; the
+   context passed to `New` triggers `Close` automatically via
+   `context.AfterFunc`.
+3. **Child channels.** `ChildFDs(tag, index, level)` creates a per-child
+   `SOCK_SEQPACKET` socketpair, starts a `DualRelay` for the receive side, and
+   returns the child-side stdout/stderr `*os.File`s for `exec.Cmd`.  A positive
+   `index` is folded into the identity (`web-2`) so replicas get distinct
+   prefixes/colors.  `Close` lets relays drain, then force-closes their receive
+   sockets after a grace period.
+
+`process.Formation` no longer knows anything about sockets or framing.  It
+takes a `process.LogSink` (`Logger() *slog.Logger` + `ChildFDs(...)`), which
+`*termhandler.TermHandler` implements, and wires the returned files into each
+child.  When `Logs` is nil it falls back to the `writelog` text pipeline into
+`slog.Default()`.
+
+### Log levels (`Formation.LogLevels`)
+
+The per-process level policy lives in `pkg/process`:
+
+```go
+type LogLevels struct {
+    Default slog.Level
+    Tags    map[string]slog.Level
+}
+```
+
+`Formation.Run` resolves each process's level as explicit `Process.LogLevel` >
+`Tags[tag]` > `Default`, then hands it to `ChildFDs` (or applies it to the
+fallback logger).  `ParseLogLevels(spec, def)` parses the CLI form
+`"info,api=debug"`: a bare entry sets `Default`, `tag=level` sets an override,
+and `def` seeds `Default` so an overrides-only spec keeps the caller's default
+(e.g. a flag default of `error`).
+
+## Approach: repurpose stdout/stderr as the log channels
 
 Instead of a dedicated file descriptor (`PROCMAN_LOG_FD`) and accompanying
-environment variable, the nested formation simply uses **stdout (fd 1)**
-as the structured log channel. This eliminates all extra fd plumbing and
-env-var coordination.
+environment variable, the nested formation uses **stdout (fd 1) and stderr
+(fd 2)** as the structured log channels. This eliminates all extra fd
+plumbing and env-var coordination.  Each frame carries a stdout/stderr
+discriminator, and the relay attaches it as a `stream` attribute so future
+rendering can treat the streams differently without a wire change.
 
 ### How it works
 
-**Parent formation:** For each child process, creates a `SOCK_SEQPACKET`
-socketpair. The send side becomes the child's stdout; the recv side stays
-in the parent and is read by a `DualRelay` dispatcher.
+**Parent formation:** For each child process and each stream,
+`TermHandler.ChildFDs` creates a `SOCK_SEQPACKET` socketpair. The send side
+becomes the child's stdout (or stderr); the recv side stays in the parent and
+is read by a `DualRelay` dispatcher started by the termhandler.
 
-**Child formation (procman):** Probes its own stdout (fd 1) via
-`getsockopt(SO_TYPE)`. If it's a `SOCK_SEQPACKET` socket, the child knows
-it's nested under a parent formation. It:
-1. Sets `O_NONBLOCK` on stdout (safe because the framer is the sole writer)
-2. Replaces its sink with a `FramerHandler` that writes binary frames to fd 1
+**Child formation (procman):** `termhandler.New` probes its own stdout and
+stderr (fd 1, fd 2) via `getsockopt(SO_TYPE)`. Each fd that is a
+`SOCK_SEQPACKET` socket is a nested log channel. It:
+1. Sets `O_NONBLOCK` on that fd (safe because the framer is its sole writer)
+2. Replaces the matching sink with a `FramerHandler` stamped with
+   `StreamStdout`/`StreamStderr` that writes binary frames to that fd
 
 **Non-procman child** (e.g. kubelet binary, trebuchet): Writes plain text
 to stdout as usual. The parent's `DualRelay` detects the text (fast byte
@@ -80,10 +137,11 @@ Optional sections (present when the corresponding flag is set):
 | Field | Type | Description |
 |---|---|---|
 | `ver` | uint8 | Frame version (1) |
-| `flags` | uint8 | Bitmap: bit0=has_tag, bit1=has_groups, bit2=has_attrs |
+| `flags` | uint8 | Bitmap: bit0=has_tag, bit1=has_groups, bit2=has_attrs, bits3-4=stream |
 | `level` | int32 LE | slog.Level as int (debug=-4, info=0, warn=4, error=8) |
 | `msglen` | uint16 LE | Length of message text (max 65535) |
 | `message` | bytes | Record message text |
+| `stream` | 2 bits | 0=unset, 1=stdout, 2=stderr (packed into flags[3:5]) |
 | `tag` | string | Process tag, extracted from the `"tag"` slog attr |
 | `groups` | []string | Handler group path from the child's `WithGroup` |
 | `attrs` | JSON | Remaining attributes as JSON object, usually empty |
@@ -118,21 +176,25 @@ Optional sections (present when the corresponding flag is set):
 
 ### Child (procman) side
 
-`NewChildFramer()` in `pkg/writelog/relay.go`:
+`termhandler.New` in `pkg/termhandler/termhandler.go` probes each stream via
+`seqpacketFd` and, when stdout is a socket, builds framers:
 
 ```go
-func NewChildFramer() *slog.Logger {
-    typ, err := syscall.GetsockoptInt(1, syscall.SOL_SOCKET, syscall.SO_TYPE)
-    if err != nil || typ != syscall.SOCK_SEQPACKET {
-        return nil  // not nested → root mode
+if fd, ok := seqpacketFd(stdout); ok {
+    h.nested = true
+    h.outHandler = writelog.NewFramer(writelog.SetupSendSocket(fd), writelog.StreamStdout, level)
+    if efd, ok := seqpacketFd(stderr); ok {
+        h.errHandler = writelog.NewFramer(writelog.SetupSendSocket(efd), writelog.StreamStderr, level)
+    } else {
+        h.errHandler = writelog.NewFramer(writelog.SetupSendSocket(fd), writelog.StreamStderr, level)
     }
-    syscall.SetNonblock(1, true)
-    return slog.New(NewFramer(1, slog.LevelDebug))
+    return h
 }
 ```
 
-Called from `Formation.Run()`. If stdout is a SEQPACKET socket, the
-formation's sink is replaced by a framer.
+`writelog.ChildSinks` remains as a low-level primitive for embedders that
+implement their own `process.LogSink`, but the CLI and termhandler do not use
+it.
 
 ### Parent side (DualRelay)
 
@@ -152,23 +214,28 @@ across successive SEQPACKET messages, flushes on EOF.
 
 ## fd hierarchy
 
-No dedicated log fd. The protocol uses fd 1 (stdout) implicitly.
+No dedicated log fd. The protocol uses fd 1 (stdout) and fd 2 (stderr).
 
-- **Root process** (stdout is a terminal or pipe): `NewChildFramer()`
-  returns nil → uses the user-configured sink (e.g. termhandler on
-  `os.Stdout`). No frames — all output is rendered directly.
-- **Nested process** (stdout is a SEQPACKET socket): `NewChildFramer()`
-  returns a framer → every record is binary-encoded and sent up stdout.
-- **Non-procman child** (writes text to stdout): text is split on
-  newlines by the parent's `DualRelay` and logged under the child's tag.
-  No structure is lost that didn't already exist.
+- **Root process** (stdio is a terminal or pipe): `termhandler.New` finds no
+  socket → renders records directly to the terminal and `ChildFDs` creates
+  child channels whose relays feed that renderer.
+- **Nested process** (fd 1/2 are SEQPACKET sockets): `termhandler.New` builds
+  framers → every record is binary-encoded and sent up the matching fd with
+  its stream discriminator.
+- **Non-procman child** (writes text to stdout/stderr): text is split on
+  newlines by the parent's `DualRelay` and logged under the child's tag with
+  a `stream` attr. No structure is lost that didn't already exist.
+
+Spawned processes are detached from the controlling terminal: stdin is the
+null device and `SysProcAttr.Setsid` puts them in a new session/process
+group, so terminal-generated signals reach only procman.
 
 ## Per-child sockets
 
-Each `Formation` creates **one SOCK_SEQPACKET socketpair per child process**.
-The send side is the child's stdout (fd 1, via `exec.Cmd.Stdout`). The recv
-side stays in the parent and is read by a `DualRelay` goroutine that knows
-the child's tag.
+Each `TermHandler.ChildFDs` call creates **one SOCK_SEQPACKET socketpair per
+stream** (stdout and stderr). The send sides become the child's fd 1 and
+fd 2 (via `exec.Cmd.Stdout`/`Stderr`). The recv sides stay in the parent and
+are read by `DualRelay` goroutines that know the child's tag and stream.
 
 This per-child design means:
 
@@ -176,7 +243,7 @@ This per-child design means:
   child to stamp its own tag or carry parent ancestry.
 - When the child exits, its send-side end-of-file is naturally detected
   by the relay (SEQPACKET recv sees EOF when all write-end refs are closed).
-- Non-procman children write text through the same socket; the relay
+- Non-procman children write text through the same sockets; the relay
   transparently handles both formats via the byte gate.
 
 ## Tag naming convention
@@ -245,39 +312,68 @@ slow sink. For the log socket:
 
 ## Relay goroutine
 
-`DualRelay` in `pkg/writelog/relay.go`. One per child, launched from
-`Formation.Run()`.
+`DualRelay` in `pkg/writelog/relay.go`. One per child socket, launched from
+`TermHandler.ChildFDs`.
 
 ```go
 func DualRelay(recv *net.UnixConn, parentSink *slog.Logger,
-               childTag string, wg *sync.WaitGroup)
+               childTag string, channelStream StreamKind, wg *sync.WaitGroup)
 ```
 
 - Reads messages from `recv` in a loop with a `MaxFrameSize+1024` buffer.
 - Fast gate: `IsFramePrefix(data)` checks byte 0.
-- Frame path: `UnmarshalBinary` → `emitRelayedFrame`.
-- Text path: `textBuf.feed` → `emit` for each complete line.
+- Frame path: `UnmarshalBinary` → `emitRelayedFrame` (frame stream wins;
+  channel stream is the fallback).
+- Text path: `textBuf.feed` → each line logged with the channel's stream.
+- Both paths attach the stream as a `"stream"` attr on the parent record.
 - On read error / EOF: flushes any remaining partial text line, exits.
 - Teardown: parent sets a past read deadline → reader wakes → exits.
 
 ## Degradation behavior
 
-- **Non-procman child** (kubelet, etcd): writes text to stdout → relay
-  splits text on newlines → logged as text under the child's tag. No
-  structured attrs, but no loss vs. a non-nested procman.
+- **Non-procman child** (kubelet, etcd): writes text to stdout/stderr →
+  relay splits text on newlines → logged as text under the child's tag with
+  its stream. No structured attrs beyond `tag`/`stream`, but no loss vs. a
+  non-nested procman.
 - **Parent crashes before relay reads**: child's send buffer holds some
   frames; when the recv socket is closed, the child's next `sendto`
   returns EPIPE → framer silently drops further records.
-- **No SEQPACKET stdout** (root mode): `NewChildFramer()` returns nil;
-  formation uses the user's sink (termhandler, etc.). The relay still runs
-  for children; it feeds the user sink with structured records when
-  children emit frames, or with text for non-procman children.
+- **No SEQPACKET stdio** (root mode): `termhandler.New` renders locally. The
+  relay still runs for children; it feeds the renderer with structured
+  records when grandchildren emit frames, or with text for non-procman
+  children.
+
+## Known issues
+
+### Non-procman text over SEQPACKET can be silently truncated
+
+The parent reads each socket with a fixed `MaxFrameSize+1024` (17408-byte)
+buffer (`dualRelayLoop` in `pkg/writelog/relay.go`). SEQPACKET is
+message-oriented: a `read` larger than the buffer is truncated and the
+surplus is **silently discarded**, and a single `write` larger than the
+socket send buffer fails with `EMSGSIZE`. A non-procman child that writes a
+stdout/stderr chunk larger than ~17 KB in one `write(2)` therefore loses
+data; a pipe does not have this behaviour.
+
+This affects text children only. Procman children use the framer, which caps
+each frame at `MaxFrameSize` and drops on `EAGAIN` rather than truncating.
+
+Related consequences / open work:
+
+- The text path also lost `writelog.Stream`'s bounded, tail-dropping async
+  queue: `dualRelayLoop` logs synchronously, so a slow sink can back-pressure
+  a blocking (non-procman) child.
+- Real fixes are a length-prefixed text envelope, or giving text children a
+  plain pipe and reserving the SEQPACKET channel for framed procman output.
+
+Until then, treat multi-KB single-write stdout bursts from non-procman
+children as potentially lossy.
 
 ## runkube integration points (not in this repo)
 
 1. **`sandbox.go`** — no change needed for the log channel: the sandbox
-   already forwards stdout (fd 1) into the container; the procman child
-   inside the sandbox auto-detects it.  No `PROCMAN_LOG_FD`, no
+   already forwards stdout/stderr into the container; the procman child
+   inside the sandbox auto-detects them.  No `PROCMAN_LOG_FD`, no
    `ExtraFiles` plumbing for logging.
 2. **`Node.RunCRIServer`** — route direct slog calls through the node
    formation's sink instead of the default logger.  This is a small

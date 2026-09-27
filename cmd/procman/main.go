@@ -34,27 +34,6 @@ func (p *procFlags) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&p.Debug, "debug", false, "enable debug logging")
 }
 
-// proclogger builds the process output sink according to --output:
-//
-//	auto - termhandler (colored, prefixed) when stdout is a terminal, a plain
-//	       text handler otherwise (e.g. when piped);
-//	term - always the termhandler, forcing color even when piped.
-//
-// Unknown values behave like auto. In either termhandler case --columns N
-// truncates each log line to N bytes.
-func proclogger(output string, columns int) *slog.Logger {
-	forceColor := output == "term"
-	if forceColor || termhandler.IsTerminal(os.Stdout) {
-		return slog.New(termhandler.New(os.Stdout, &termhandler.Options{
-			Level:   slog.LevelDebug,
-			Columns: columns,
-			Colors:  forceColor,
-		}))
-	}
-	// Piped output: no color, no per-process prefixes.
-	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-}
-
 func main() {
 	p := &procFlags{}
 	p.AddFlags(pflag.CommandLine)
@@ -65,34 +44,49 @@ func main() {
 	if p.Debug {
 		ll = slog.LevelDebug
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{AddSource: false, Level: ll})))
-	plogger := proclogger(p.Output, p.Columns)
-	// Keystrokes on the foreground terminal would otherwise be echoed into the
-	// streaming log output; procman never reads stdin, so hide them and
-	// restore the terminal state on every exit path (os.Exit bypasses defer,
-	// so the explicit calls below mirror the deferred restore).
-	restoreEcho := termhandler.NoEcho(os.Stdout)
-	defer restoreEcho()
+
+	// The signal context is the formation's lifetime; the termhandler uses it
+	// to restore terminal state and stop relay goroutines on shutdown.
+	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT)
+	defer stop()
+
+	// --output auto: plain text when stdout is not a terminal; the colored,
+	// prefixed term renderer otherwise. --output term forces the term renderer
+	// even when piped (and therefore color). Unknown values behave like auto.
+	plain := p.Output != "term" && !termhandler.IsTerminal(os.Stdout)
+
+	logs := termhandler.New(ctx, os.Stdin, os.Stdout, os.Stderr, &termhandler.Options{
+		Level:   ll,
+		Columns: p.Columns,
+		Colors:  p.Output == "term",
+		Plain:   plain,
+	})
+	defer logs.Close()
+
+	// A nested procman formation frames its own records up the stderr socket;
+	// in root mode the process-wide default logger stays a plain text handler
+	// on stderr (the term renderer only prefixes tagged process output).
+	if logs.Nested() {
+		slog.SetDefault(logs.ErrLogger())
+	} else {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{AddSource: false, Level: ll})))
+	}
 
 	if p.Workdir == "" {
-		w := filepath.Dir(p.Procfile)
-		p.Workdir = w
+		p.Workdir = filepath.Dir(p.Procfile)
 	}
 
 	fm := process.Formation{
 		Workdir: p.Workdir,
-		Sink:    plogger,
+		Logs:    logs,
 	}
 
 	if err := fm.LoadFile(p.Procfile); err != nil {
 		slog.Error("fm.LoadFile", "err", err)
-		restoreEcho()
+		logs.Close()
 		os.Exit(1)
 	}
-
-	ctx := context.Background()
-	ctx, stop := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT)
-	defer stop()
 
 	if err := fm.Run(ctx); err != nil {
 		// A process that exited on its own determines the formation's status:
@@ -107,11 +101,11 @@ func main() {
 				lv = slog.LevelWarn
 			}
 			slog.Log(ctx, lv, "fm.Run", "err", err)
-			restoreEcho()
+			logs.Close()
 			os.Exit(pe.Code)
 		}
 		slog.Error("fm.Run", "err", err)
-		restoreEcho()
+		logs.Close()
 		os.Exit(1)
 	}
 }

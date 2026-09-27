@@ -28,7 +28,9 @@ func SetupRecvConn(fd int) *net.UnixConn {
 
 // DualRelay reads messages from recv and dispatches each to either the frame
 // path (parsed and re-emitted into parentSink with group nesting) or the text
-// path (split on newlines and logged as text under childTag).
+// path (split on newlines and logged as text under childTag).  channelStream
+// is the stream the socket belongs to (stdout/stderr); it is used as the
+// fallback when a decoded frame does not carry its own stream.
 //
 // The gate is a single-byte check: if the first byte of a message equals
 // frameVersion, it is assumed to be a binary frame; otherwise it's text.
@@ -36,7 +38,7 @@ func SetupRecvConn(fd int) *net.UnixConn {
 //
 // wg is optional; when non-nil, Add(1) is called before the loop and Done
 // after it exits.
-func DualRelay(recv *net.UnixConn, parentSink *slog.Logger, childTag string, wg *sync.WaitGroup) {
+func DualRelay(recv *net.UnixConn, parentSink *slog.Logger, childTag string, channelStream StreamKind, wg *sync.WaitGroup) {
 	if wg != nil {
 		wg.Add(1)
 	}
@@ -44,7 +46,7 @@ func DualRelay(recv *net.UnixConn, parentSink *slog.Logger, childTag string, wg 
 		if wg != nil {
 			defer wg.Done()
 		}
-		dualRelayLoop(recv, parentSink, childTag)
+		dualRelayLoop(recv, parentSink, childTag, channelStream)
 	}()
 }
 
@@ -81,12 +83,16 @@ func (tb *textBuf) flush(emit func(line string)) {
 	}
 }
 
-func dualRelayLoop(recv *net.UnixConn, parentSink *slog.Logger, childTag string) {
+func dualRelayLoop(recv *net.UnixConn, parentSink *slog.Logger, childTag string, channelStream StreamKind) {
 	buf := make([]byte, MaxFrameSize+1024)
 	var tb textBuf
 
-	// Pre-allocate a logger for text lines (childTag group only).
-	textLogger := parentSink.WithGroup(childTag).With(slog.String("tag", childTag))
+	// Pre-allocate a logger for text lines (childTag group only).  Text has
+	// no frame, so its stream is known from the channel it was read on.
+	textLogger := parentSink.WithGroup(childTag).With(
+		slog.String("tag", childTag),
+		slog.String("stream", channelStream.String()),
+	)
 
 	for {
 		n, err := recv.Read(buf)
@@ -116,7 +122,7 @@ func dualRelayLoop(recv *net.UnixConn, parentSink *slog.Logger, childTag string)
 				})
 				continue
 			}
-			emitRelayedFrame(parentSink, childTag, frame)
+			emitRelayedFrame(parentSink, childTag, channelStream, frame)
 		} else {
 			// Text from a non-procman child.
 			tb.feed(string(msg), func(line string) {
@@ -127,10 +133,17 @@ func dualRelayLoop(recv *net.UnixConn, parentSink *slog.Logger, childTag string)
 }
 
 // emitRelayedFrame re-emits a decoded frame into the parent sink with
-// proper group nesting.
-func emitRelayedFrame(parentSink *slog.Logger, childTag string, frame Frame) {
+// proper group nesting.  The frame's own Stream is preserved; when it is
+// absent (an older/foreign sender) channelStream is used instead.  The
+// stream is attached as a "stream" attribute so stream-aware rendering can
+// use it later; the termhandler ignores attrs, so current rendering is
+// unchanged.
+func emitRelayedFrame(parentSink *slog.Logger, childTag string, channelStream StreamKind, frame Frame) {
 	if frame.Message == "" {
 		return
+	}
+	if frame.Stream == StreamUnset {
+		frame.Stream = channelStream
 	}
 
 	// Build the group chain: childTag + frame.Groups (the child's own
@@ -156,26 +169,36 @@ func emitRelayedFrame(parentSink *slog.Logger, childTag string, frame Frame) {
 	if frame.Tag != "" {
 		attrs = append(attrs, slog.String("tag", frame.Tag))
 	}
+	attrs = append(attrs, slog.String("stream", frame.Stream.String()))
 
 	logger.LogAttrs(context.Background(), slog.Level(frame.Level), frame.Message, attrs...)
 }
 
 // --- Child-side autodetection ---
 
-// NewChildFramer probes the child's stdout (fd 1) to determine whether it is
-// connected to a parent formation's SOCK_SEQPACKET log socket.  If so, it
-// sets O_NONBLOCK on stdout and returns a *slog.Logger backed by a
-// FramerHandler writing to fd 1.  If stdout is not a SEQPACKET socket (pipe,
-// terminal, file) it returns nil — the caller should use its own sink (root
-// mode).
-func NewChildFramer() *slog.Logger {
-	typ, err := syscall.GetsockoptInt(1, syscall.SOL_SOCKET, syscall.SO_TYPE)
+// ChildSinks probes the child's standard streams (fd 1 and fd 2) to
+// determine whether they are connected to a parent formation's
+// SOCK_SEQPACKET log sockets.  Each fd that is a SEQPACKET socket is made
+// non-blocking and wrapped in a framer stamped with its stream; fds that are
+// not sockets yield nil.
+//
+// A nested procman formation uses the stdout sink for its structured records
+// and the stderr sink for its own error/default output.  A non-nested process
+// (pipe, terminal, file) returns (nil, nil) and keeps its own sinks.
+func ChildSinks() (stdout, stderr *slog.Logger) {
+	stdout = childSink(1, StreamStdout)
+	stderr = childSink(2, StreamStderr)
+	return stdout, stderr
+}
+
+func childSink(fd int, stream StreamKind) *slog.Logger {
+	typ, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_TYPE)
 	if err != nil || typ != syscall.SOCK_SEQPACKET {
 		return nil
 	}
-	// Make stdout non-blocking so the framer can drop on EAGAIN instead of
-	// blocking the child process.  This is safe because the framer is the
-	// sole writer to stdout once the formation sink is replaced.
-	_ = syscall.SetNonblock(1, true)
-	return slog.New(NewFramer(1, slog.LevelDebug))
+	// Make the socket non-blocking so the framer can drop on EAGAIN instead
+	// of blocking the child.  This is safe because the framer is the sole
+	// writer to that fd once the sink is replaced.
+	_ = syscall.SetNonblock(fd, true)
+	return slog.New(NewFramer(fd, stream, slog.LevelDebug))
 }
