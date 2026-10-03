@@ -338,6 +338,7 @@ func NewFramer(sendFd int, stream StreamKind, level slog.Leveler) *FramerHandler
 	return &FramerHandler{
 		sendFd: sendFd,
 		stream: stream,
+		level:  level,
 	}
 }
 

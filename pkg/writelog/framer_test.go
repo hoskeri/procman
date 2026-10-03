@@ -176,6 +176,37 @@ func (h *captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 }
 func (h *captureHandler) WithGroup(_ string) slog.Handler { return h }
 
+// TestFramerEnabledLevel is a regression test for NewFramer dropping the
+// caller-supplied level: a nil level made FramerHandler.Enabled panic as soon
+// as a group was applied (all real loggers use WithGroup).
+func TestFramerEnabledLevel(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("grouped logger does not panic and respects level", func(t *testing.T) {
+		f := NewFramer(-1, StreamStdout, slog.LevelInfo).WithGroup("procman")
+		if !f.Enabled(ctx, slog.LevelWarn) {
+			t.Fatal("warn should be enabled at LevelInfo")
+		}
+		if f.Enabled(ctx, slog.LevelDebug) {
+			t.Fatal("debug should be disabled at LevelInfo")
+		}
+	})
+
+	t.Run("nil level defaults to info", func(t *testing.T) {
+		f := NewFramer(-1, StreamStderr, nil).WithGroup("g")
+		if !f.Enabled(ctx, slog.LevelInfo) || f.Enabled(ctx, slog.LevelDebug) {
+			t.Fatal("nil level should default to LevelInfo")
+		}
+	})
+
+	t.Run("override wins", func(t *testing.T) {
+		f := NewFramer(-1, StreamStdout, slog.LevelInfo).WithGroup("g").(*FramerHandler).WithOverride("g", slog.LevelDebug)
+		if !f.Enabled(ctx, slog.LevelDebug) {
+			t.Fatal("override to LevelDebug should enable debug")
+		}
+	})
+}
+
 // TestFramerRelayRoundTrip creates a socketpair, writes frames from a
 // FramerHandler, reads them via DualRelay, and verifies the record arrives at
 // the parent sink with levels, message, tag, and attrs preserved.
