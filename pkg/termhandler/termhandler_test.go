@@ -282,6 +282,43 @@ func TestChildFDsComponentLevelOverride(t *testing.T) {
 	}
 }
 
+// TestChildFDsSuppressesDebugAtInfo verifies that a Debug frame relayed from a
+// child is suppressed when the parent sink's ambient level is Info, while an
+// Info frame at the same level is rendered.
+func TestChildFDsSuppressesDebugAtInfo(t *testing.T) {
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdoutR.Close()
+
+	th := New(context.Background(), nil, stdoutW, stdoutW, &Options{Level: slog.LevelInfo})
+	resolver := func([]string) (slog.Level, bool) { return slog.LevelInfo, false }
+	outFD, errFD, err := th.ChildFDs("webhook", 0, resolver)
+	if err != nil {
+		t.Fatalf("ChildFDs: %v", err)
+	}
+
+	framer := writelog.NewFramer(writelog.SetupSendSocket(int(outFD.Fd())), writelog.StreamStdout, slog.LevelDebug)
+	logger := slog.New(framer)
+	logger.Debug("debug-should-hide")
+	logger.Info("info-should-show")
+
+	errFD.Close()
+	outFD.Close()
+	th.Close()
+	stdoutW.Close()
+
+	out, _ := io.ReadAll(stdoutR)
+	s := string(out)
+	if strings.Contains(s, "debug-should-hide") {
+		t.Errorf("Debug frame should be suppressed at ambient Info, got %q", s)
+	}
+	if !strings.Contains(s, "info-should-show") {
+		t.Errorf("Info frame should be rendered, got %q", s)
+	}
+}
+
 // TestChildFDsRendersAttrs verifies that slog attributes survive the relay and
 // are rendered (logfmt) after the message, with the display tag as the prefix
 // and slog groups as attr namespaces -- the whole point of the tag/group split.
@@ -312,6 +349,45 @@ func TestChildFDsRendersAttrs(t *testing.T) {
 	for _, want := range []string{
 		"webhook/audit | admission audit ev=content",
 		"webhook/api | handled req.id=42",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, s)
+		}
+	}
+}
+
+// TestChildFDsRendersInlineGroupAttrs guards the runkube admission/authorization
+// log shape: `Logger.Log(ctx, lvl, msg, "", slog.Group("", ...).Value)` puts an
+// empty-key inline group on the record.  Those must be flattened into their
+// members, not dropped before they reach the wire.
+func TestChildFDsRendersInlineGroupAttrs(t *testing.T) {
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdoutR.Close()
+
+	th := New(context.Background(), nil, stdoutW, stdoutW, &Options{})
+	outFD, errFD, err := th.ChildFDs("webhook", 0, nil)
+	if err != nil {
+		t.Fatalf("ChildFDs: %v", err)
+	}
+
+	framer := writelog.NewFramer(writelog.SetupSendSocket(int(outFD.Fd())), writelog.StreamStdout, slog.LevelDebug)
+	logger := writelog.WithTag(slog.New(framer), "validate")
+	logger.Log(context.Background(), slog.LevelInfo, "admission", "",
+		slog.Group("", "operation", "CREATE", "uid", "abc-123").Value,
+		"", slog.Group("", "patched", false).Value)
+
+	errFD.Close()
+	outFD.Close()
+	th.Close()
+	stdoutW.Close()
+
+	out, _ := io.ReadAll(stdoutR)
+	s := string(out)
+	for _, want := range []string{
+		"webhook/validate | admission operation=CREATE uid=abc-123 patched=false",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("expected %q in output, got:\n%s", want, s)

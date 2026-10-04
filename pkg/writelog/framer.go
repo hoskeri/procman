@@ -3,7 +3,6 @@ package writelog
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,13 +10,12 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
-	"unicode"
 )
 
 // MaxFrameSize is the maximum encoded frame payload in bytes (for a single
-// datagram). Records whose encoding exceeds this are truncated by trimming
-// the message text; if still too large they are silently dropped.
+// datagram). Records whose encoding exceeds this are shrink-to-fit by trimming
+// the message text, then oversized attribute values, so a record is emitted
+// rather than dropped whenever possible.
 const MaxFrameSize = 16384
 
 // StreamKind identifies which standard stream a framed record originated from. // This type is used to distinguish between stdout and stderr streams.
@@ -47,26 +45,27 @@ func (s StreamKind) String() string {
 // SOCK_SEQPACKET log socket (a child's stdout or stderr in nested mode).
 //
 // The wire format is binary — see MarshalBinary / UnmarshalBinary for the
-// on-the-wire layout.  Attrs are carried as raw JSON bytes.
+// on-the-wire layout.  Attrs are carried as a compact binary section (see
+// attrs.go), preserving slog kinds and attribute order.
 //
 // Tag and Groups are distinct: Tag is the sender's display tag path (the
 // component path, joined by "/"; the receiving formation prepends its own
 // process tag), while Groups is the slog attribute namespace path used to
 // qualify attrs.  Ordinary process output uses neither.
 type Frame struct {
-	Version   int        // wire version (1)
-	Level     int        // slog.Level as int
-	Tag       string     // component tag path, "/"-joined (empty = no component)
-	Stream    StreamKind // originating standard stream (stdout/stderr)
-	Message   string     // record message
-	Groups    []string   // attr namespace path (slog WithGroup)
-	AttrsJSON []byte     // raw JSON object "{...}", nil when empty
+	Version int        // wire version (2)
+	Level   int        // slog.Level as int
+	Tag     string     // component tag path, "/"-joined (empty = no component)
+	Stream  StreamKind // originating standard stream (stdout/stderr)
+	Message string     // record message
+	Groups  []string   // attr namespace path (slog WithGroup)
+	Attrs   []byte     // encoded attrs section, nil when empty
 }
 
 // --- Binary wire format ---
 //
 // Header (fixed 8 bytes):
-//   [0]     ver      uint8 (1)
+//   [0]     ver      uint8 (2)
 //   [1]     flags    uint8 (bit0=has_tag, bit1=has_groups, bit2=has_attrs)
 //   [2:6]   level    int32 little-endian
 //   [6:8]   msglen   uint16 little-endian (message text length)
@@ -75,10 +74,10 @@ type Frame struct {
 // Optional sections (present when the corresponding flag is set):
 //   tag:     [len:uint8][data]
 //   groups:  [count:uint8]{[len:uint8][data]}...
-//   attrs:   remaining bytes of the message = raw JSON object
+//   attrs:   remaining bytes of the message = encoded attrs section (attrs.go)
 
 const (
-	frameVersion = 1
+	frameVersion = 2
 
 	frameFlagHasTag    byte = 0x01
 	frameFlagHasGroups byte = 0x02
@@ -101,8 +100,8 @@ func (f *Frame) marshalSize() int {
 	for _, g := range f.Groups {
 		n += 1 + len(g)
 	}
-	if len(f.AttrsJSON) > 0 {
-		n += len(f.AttrsJSON)
+	if len(f.Attrs) > 0 {
+		n += len(f.Attrs)
 	}
 	return n
 }
@@ -130,7 +129,7 @@ func (f *Frame) MarshalBinary() ([]byte, error) {
 	if len(f.Groups) > 0 {
 		flags |= frameFlagHasGroups
 	}
-	if len(f.AttrsJSON) > 0 {
+	if len(f.Attrs) > 0 {
 		flags |= frameFlagHasAttrs
 	}
 	flags |= byte(f.Stream&0x3) << frameStreamShift
@@ -168,9 +167,9 @@ func (f *Frame) MarshalBinary() ([]byte, error) {
 		}
 	}
 
-	// Attrs (raw JSON, remainder of message)
-	if len(f.AttrsJSON) > 0 {
-		buf = append(buf, f.AttrsJSON...)
+	// Attrs (encoded attr section, remainder of message)
+	if len(f.Attrs) > 0 {
+		buf = append(buf, f.Attrs...)
 	}
 
 	return buf, nil
@@ -190,7 +189,9 @@ func (f *Frame) UnmarshalBinary(data []byte) error {
 
 	flags := data[1]
 	f.Stream = StreamKind((flags & frameStreamMask) >> frameStreamShift)
-	f.Level = int(binary.LittleEndian.Uint32(data[2:6]))
+	// Level is a signed slog.Level (Debug is negative), encoded as int32;
+	// decode through int32 so it is not widened to a large positive value.
+	f.Level = int(int32(binary.LittleEndian.Uint32(data[2:6])))
 
 	msglen := int(binary.LittleEndian.Uint16(data[6:8]))
 	end := 8 + msglen
@@ -237,10 +238,10 @@ func (f *Frame) UnmarshalBinary(data []byte) error {
 		}
 	}
 
-	// Attrs (remaining bytes = raw JSON)
+	// Attrs (remaining bytes = encoded attr section)
 	if flags&frameFlagHasAttrs != 0 && off < len(data) {
-		f.AttrsJSON = make([]byte, len(data)-off)
-		copy(f.AttrsJSON, data[off:])
+		f.Attrs = make([]byte, len(data)-off)
+		copy(f.Attrs, data[off:])
 	}
 
 	return nil
@@ -252,7 +253,7 @@ const maxMsgLen = 65535
 
 // IsFramePrefix returns true when data starts with a valid binary frame header
 // (version byte == frameVersion).  This is the fast gate for the dual-mode
-// relay: a single byte comparison vs. a full JSON parse.
+// relay: a single byte comparison before attempting a full frame decode.
 func IsFramePrefix(data []byte) bool {
 	return len(data) >= frameHeaderSize && data[0] == frameVersion
 }
@@ -265,19 +266,10 @@ func WriteFrame(sendFd int, f *Frame) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-
-	// Truncate if needed by shrinking the message text.
-	if len(b) > MaxFrameSize && len(f.Message) > 0 {
-		for len(b) > MaxFrameSize && len(f.Message) > 0 {
-			f.Message = f.Message[:len(f.Message)*3/4]
-			if len(f.Message) < 10 {
-				f.Message = f.Message[:10]
-				break
-			}
-			b, err = f.MarshalBinary()
-			if err != nil {
-				return false, err
-			}
+	if len(b) > MaxFrameSize {
+		f.fit(MaxFrameSize)
+		if b, err = f.MarshalBinary(); err != nil {
+			return false, err
 		}
 	}
 	if len(b) > MaxFrameSize {
@@ -295,6 +287,56 @@ func WriteFrame(sendFd int, f *Frame) (bool, error) {
 		return false, err
 	}
 	return false, io.ErrShortWrite
+}
+
+// fit shrinks f in place so MarshalBinary encodes at most limit bytes.  The
+// message text is trimmed first (the historical behavior); if the fixed
+// overhead (mostly the attrs section) still leaves no room, attrs are shrunk
+// by truncating their longest string values and dropping trailing attrs.
+//
+// Every slice is clamped to the string's actual length, so a short message
+// paired with a large attrs payload cannot panic (the previous truncation
+// sliced [:10] unconditionally, which crashed on messages shorter than that).
+func (f *Frame) fit(limit int) {
+	orig := f.Message
+	if len(orig) > maxMsgLen {
+		orig = orig[:maxMsgLen]
+	}
+
+	// Fixed overhead excluding the message and attrs (header + tag + groups).
+	fixedNoAttrs := f.marshalSize() - len(f.Message) - len(f.Attrs)
+	if fixedNoAttrs+len(f.Attrs)+len(orig) <= limit {
+		f.Message = orig
+		return
+	}
+
+	// Reserve up to half the frame for the message, and bound attrs to the
+	// rest so the message is not silently emptied by a giant attrs payload.
+	msgBudget := len(orig)
+	if maxMsg := limit/2 - fixedNoAttrs; msgBudget > maxMsg {
+		msgBudget = maxMsg
+	}
+	if msgBudget < 0 {
+		msgBudget = 0
+	}
+	attrBudget := limit - fixedNoAttrs - msgBudget
+	if attrBudget < 0 {
+		attrBudget = 0
+	}
+	f.Attrs = fitAttrs(f.Attrs, attrBudget)
+
+	avail := limit - fixedNoAttrs - len(f.Attrs)
+	if avail < 0 {
+		avail = 0
+	}
+	if avail > maxMsgLen {
+		avail = maxMsgLen
+	}
+	if len(orig) > avail {
+		f.Message = orig[:avail]
+	} else {
+		f.Message = orig
+	}
 }
 
 // ReadFrame reads one message from recv (a *os.File wrapping a SOCK_SEQPACKET
@@ -415,21 +457,17 @@ func (h *FramerHandler) Handle(_ context.Context, rec slog.Record) error {
 
 	// Collect record attrs + handler attrs.  The display tag is carried
 	// separately in Tag (via WithTag), so a "tag" attr is now just an attr.
+	// Empty-key attrs are kept here and normalized by appendAttrSection:
+	// slog.Group("", ...) is an inline group, not a stray attr.
 	var allAttrs []slog.Attr
 	rec.Attrs(func(a slog.Attr) bool {
-		if a.Key != "" {
-			allAttrs = append(allAttrs, a)
-		}
+		allAttrs = append(allAttrs, a)
 		return true
 	})
-	for _, a := range h.attrs {
-		if a.Key != "" {
-			allAttrs = append(allAttrs, a)
-		}
-	}
+	allAttrs = append(allAttrs, h.attrs...)
 
 	if len(allAttrs) > 0 {
-		f.AttrsJSON = marshalAttrsJSON(allAttrs)
+		f.Attrs = appendAttrSection(nil, allAttrs)
 	}
 
 	// Write to socket (O_NONBLOCK).
@@ -443,79 +481,6 @@ func (h *FramerHandler) Handle(_ context.Context, rec slog.Record) error {
 		h.mu.Unlock()
 	}
 	return nil
-}
-
-// marshalAttrsJSON converts a slice of slog.Attr into a JSON object []byte.
-// Returns nil when the slice is empty or contains only empty-key attrs.
-func marshalAttrsJSON(attrs []slog.Attr) []byte {
-	if len(attrs) == 0 {
-		return nil
-	}
-	m := make(map[string]any, len(attrs))
-	for _, a := range attrs {
-		if a.Key != "" {
-			m[a.Key] = attrValueToJSON(a.Value)
-		}
-	}
-	if len(m) == 0 {
-		return nil
-	}
-	b, err := json.Marshal(m)
-	if err != nil {
-		return nil
-	}
-	return b
-}
-
-// attrValueToJSON converts a resolved slog.Value to a Go value suitable for
-// JSON encoding.
-func attrValueToJSON(v slog.Value) any {
-	v = v.Resolve()
-	switch v.Kind() {
-	case slog.KindString:
-		return v.String()
-	case slog.KindInt64:
-		return v.Int64()
-	case slog.KindUint64:
-		return v.Uint64()
-	case slog.KindFloat64:
-		return v.Float64()
-	case slog.KindBool:
-		return v.Bool()
-	case slog.KindDuration:
-		return v.Duration().String()
-	case slog.KindTime:
-		return v.Time().Format(time.RFC3339Nano)
-	case slog.KindGroup:
-		m := make(map[string]any, len(v.Group()))
-		for _, a := range v.Group() {
-			m[a.Key] = attrValueToJSON(a.Value)
-		}
-		return m
-	default:
-		s := v.String()
-		if looksLikeJSONToken(s) {
-			s = fmt.Sprintf("%q", s)
-		}
-		return s
-	}
-}
-
-func looksLikeJSONToken(s string) bool {
-	if s == "true" || s == "false" || s == "null" {
-		return true
-	}
-	if len(s) > 0 && (s[0] == '"' || s[0] == '{' || s[0] == '[') {
-		return true
-	}
-	hasDigit := false
-	for _, r := range s {
-		if unicode.IsDigit(r) {
-			hasDigit = true
-			break
-		}
-	}
-	return hasDigit
 }
 
 func isEAGAIN(err error) bool {

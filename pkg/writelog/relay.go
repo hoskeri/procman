@@ -1,9 +1,7 @@
 package writelog
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net"
 	"os"
@@ -34,7 +32,7 @@ func SetupRecvConn(fd int) *net.UnixConn {
 //
 // The gate is a single-byte check: if the first byte of a message equals
 // frameVersion, it is assumed to be a binary frame; otherwise it's text.
-// This avoids any JSON parse overhead on text messages.
+// This avoids any frame-decode overhead on text messages.
 //
 // wg is optional; when non-nil, Add(1) is called before the loop and Done
 // after it exits.
@@ -161,18 +159,10 @@ func emitRelayedFrame(parentSink *slog.Logger, childTag string, channelStream St
 		logger = logger.WithGroup(g)
 	}
 
-	// Reconstruct attrs from JSON bytes (usually nil in practice).
+	// Reconstruct attrs from the encoded section (usually nil in practice).
 	var attrs []slog.Attr
-	if len(frame.AttrsJSON) > 0 {
-		var m map[string]any
-		d := json.NewDecoder(bytes.NewReader(frame.AttrsJSON))
-		d.UseNumber()
-		if d.Decode(&m) == nil {
-			attrs = make([]slog.Attr, 0, len(m))
-			for k, v := range m {
-				attrs = append(attrs, slog.Any(k, v))
-			}
-		}
+	if len(frame.Attrs) > 0 {
+		attrs, _ = unmarshalAttrs(frame.Attrs)
 	}
 	// Plain (non-tag-capable) sinks have no prefix, so keep the component tag
 	// visible as an attribute, matching the historical behavior.

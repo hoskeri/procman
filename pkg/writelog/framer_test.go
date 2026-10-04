@@ -2,7 +2,6 @@ package writelog
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"os"
 	"strings"
@@ -15,17 +14,20 @@ import (
 // TestFrameRoundTrip verifies that a Frame survives MarshalBinary/UnmarshalBinary
 // with all fields preserved.
 func TestFrameRoundTrip(t *testing.T) {
-	// Build attrs as JSON bytes (what FramerHandler produces)
-	attrsJSON, _ := json.Marshal(map[string]any{"pid": float64(42), "signal": "SIGKILL"})
+	// Build attrs as the binary section (what FramerHandler produces).
+	attrs := appendAttrSection(nil, []slog.Attr{
+		slog.Int("pid", 42),
+		slog.String("signal", "SIGKILL"),
+	})
 
 	orig := Frame{
-		Version:   1,
-		Level:     int(slog.LevelError),
-		Tag:       "kubelet",
-		Stream:    StreamStderr,
-		Message:   "out of memory",
-		Groups:    []string{"kubelet"},
-		AttrsJSON: attrsJSON,
+		Version: frameVersion,
+		Level:   int(slog.LevelError),
+		Tag:     "kubelet",
+		Stream:  StreamStderr,
+		Message: "out of memory",
+		Groups:  []string{"kubelet"},
+		Attrs:   attrs,
 	}
 	b, err := orig.MarshalBinary()
 	if err != nil {
@@ -61,15 +63,15 @@ func TestFrameRoundTrip(t *testing.T) {
 	if len(got.Groups) != 1 || got.Groups[0] != "kubelet" {
 		t.Errorf("Groups: got %v, want %v", got.Groups, orig.Groups)
 	}
-	if len(got.AttrsJSON) == 0 {
-		t.Fatal("expected non-empty AttrsJSON")
+	gotAttrs, ok := unmarshalAttrs(got.Attrs)
+	if !ok || len(gotAttrs) != 2 {
+		t.Fatalf("attrs: ok=%v len=%d", ok, len(gotAttrs))
 	}
-	var attrsMap map[string]any
-	if err := json.Unmarshal(got.AttrsJSON, &attrsMap); err != nil {
-		t.Fatalf("unmarshal attrs: %v", err)
+	if gotAttrs[0].Key != "pid" || gotAttrs[0].Value.Int64() != 42 {
+		t.Errorf("attr[0]: got %+v", gotAttrs[0])
 	}
-	if attrsMap["pid"] != float64(42) || attrsMap["signal"] != "SIGKILL" {
-		t.Errorf("Attrs: got %v", attrsMap)
+	if gotAttrs[1].Key != "signal" || gotAttrs[1].Value.String() != "SIGKILL" {
+		t.Errorf("attr[1]: got %+v", gotAttrs[1])
 	}
 }
 
@@ -79,7 +81,7 @@ func TestFrameRoundTrip(t *testing.T) {
 func TestStreamRoundTrip(t *testing.T) {
 	for _, stream := range []StreamKind{StreamUnset, StreamStdout, StreamStderr} {
 		orig := Frame{
-			Version: 1,
+			Version: frameVersion,
 			Level:   int(slog.LevelInfo),
 			Tag:     "web",
 			Stream:  stream,
@@ -106,7 +108,7 @@ func TestStreamRoundTrip(t *testing.T) {
 // TestFrameRoundTripNoAttrs verifies the common case (no attrs) round-trips.
 func TestFrameRoundTripNoAttrs(t *testing.T) {
 	orig := Frame{
-		Version: 1,
+		Version: frameVersion,
 		Level:   0,
 		Tag:     "web",
 		Message: "started",
@@ -123,15 +125,15 @@ func TestFrameRoundTripNoAttrs(t *testing.T) {
 	if got.Message != "started" || got.Tag != "web" {
 		t.Errorf("round-trip: got %+v", got)
 	}
-	if len(got.AttrsJSON) != 0 {
-		t.Errorf("expected no attrs, got %d bytes", len(got.AttrsJSON))
+	if len(got.Attrs) != 0 {
+		t.Errorf("expected no attrs, got %d bytes", len(got.Attrs))
 	}
 }
 
 // TestIsFramePrefix verifies the fast gate for the dual-mode relay.
 func TestIsFramePrefix(t *testing.T) {
 	// Binary frame header starts with frameVersion.
-	f := Frame{Version: 1, Level: 0, Message: "test"}
+	f := Frame{Version: frameVersion, Level: 0, Message: "test"}
 	b, _ := f.MarshalBinary()
 	if !IsFramePrefix(b) {
 		t.Error("expected IsFramePrefix true for binary frame")
@@ -148,7 +150,7 @@ func TestIsFramePrefix(t *testing.T) {
 	}
 
 	// Wrong version byte should be false.
-	if IsFramePrefix([]byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) {
+	if IsFramePrefix([]byte{frameVersion + 1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) {
 		t.Error("expected IsFramePrefix false for wrong version")
 	}
 }
@@ -279,6 +281,54 @@ func TestFramerRelayRoundTrip(t *testing.T) {
 	}
 	if got := attrString(r, "count"); got != "7" {
 		t.Errorf("count attr: got %q, want 7", got)
+	}
+}
+
+// TestFramerHandlerLargeAttrsNoPanic is the end-to-end regression for the
+// reported crash: a short message with an oversize attrs value must be framed
+// (truncated) rather than panicking the logging call.
+func TestFramerHandlerLargeAttrsNoPanic(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.SetNonblock(fds[1], true); err != nil {
+		t.Fatal(err)
+	}
+	sendFd := fds[1]
+	recvConn := SetupRecvConn(fds[0])
+
+	var (
+		mu   sync.Mutex
+		seen []slog.Record
+	)
+	recorder := slog.New(&captureHandler{fn: func(ctx context.Context, r slog.Record) error {
+		mu.Lock()
+		seen = append(seen, r)
+		mu.Unlock()
+		return nil
+	}})
+
+	var relayWg sync.WaitGroup
+	DualRelay(recvConn, recorder, "parent", StreamStderr, &relayWg)
+	time.Sleep(10 * time.Millisecond)
+
+	framerLogger := slog.New(NewFramer(sendFd, StreamStderr, slog.LevelError).WithTag("webhook"))
+
+	// Must not panic (previously sliced Message[:10] on a 3-byte message).
+	framerLogger.Error("err", "stack", strings.Repeat("S", 4*MaxFrameSize))
+
+	syscall.Close(sendFd)
+	relayWg.Wait()
+	recvConn.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) == 0 {
+		t.Fatal("expected the oversize record to be relayed, got none")
+	}
+	if seen[0].Message != "err" {
+		t.Errorf("message: got %q, want %q", seen[0].Message, "err")
 	}
 }
 
@@ -535,7 +585,7 @@ func TestRelayTeardown(t *testing.T) {
 // multiple feed calls and flushes the final partial line.
 func BenchmarkFrameEncodeDecode(b *testing.B) {
 	f := Frame{
-		Version: 1,
+		Version: frameVersion,
 		Level:   int(slog.LevelInfo),
 		Tag:     "kubelet",
 		Message: "hello from the child formation process",
@@ -552,6 +602,35 @@ func BenchmarkFrameEncodeDecode(b *testing.B) {
 		for range b.N {
 			var got Frame
 			got.UnmarshalBinary(buf)
+		}
+	})
+}
+
+// benchAttrs is a representative structured record from a tagged component
+// (e.g. runkube's webhook API): several typed attrs, one long string.
+func benchAttrs() []slog.Attr {
+	return []slog.Attr{
+		slog.String("method", "POST"),
+		slog.String("path", "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations"),
+		slog.Int("status", 200),
+		slog.Duration("duration", 3*time.Millisecond),
+		slog.String("sni", "webhook.runkube.local"),
+	}
+}
+
+func BenchmarkAttrsCodec(b *testing.B) {
+	attrs := benchAttrs()
+	encoded := appendAttrSection(nil, attrs)
+	b.SetBytes(int64(len(encoded)))
+
+	b.Run("Encode", func(b *testing.B) {
+		for range b.N {
+			_ = appendAttrSection(nil, attrs)
+		}
+	})
+	b.Run("Decode", func(b *testing.B) {
+		for range b.N {
+			_, _ = unmarshalAttrs(encoded)
 		}
 	})
 }
@@ -579,5 +658,93 @@ func TestTextBuf(t *testing.T) {
 	tb.flush(emit)
 	if len(got) != 4 || got[3] != "end" {
 		t.Fatalf("after flush: got %v", got)
+	}
+}
+
+// TestFrameFitShortMessageLargeAttrs is a regression for a panic in the old
+// truncation path: a short message (< 10 bytes) with an attrs payload larger
+// than MaxFrameSize sliced f.Message[:10] and crashed the logging call.
+func TestFrameFitShortMessageLargeAttrs(t *testing.T) {
+	attrs := appendAttrSection(nil, []slog.Attr{
+		slog.String("err", strings.Repeat("stack line\n", 4000)),
+		slog.Int("status", 500),
+	})
+	f := Frame{
+		Version: frameVersion,
+		Level:   int(slog.LevelError),
+		Tag:     "webhook",
+		Message: "http2", // 5 bytes: shorter than the old [:10] slice
+		Attrs:   attrs,
+	}
+	if got := f.marshalSize(); got <= MaxFrameSize {
+		t.Fatalf("precondition: attrs should exceed MaxFrameSize, got %d", got)
+	}
+
+	f.fit(MaxFrameSize) // must not panic
+
+	if got := f.marshalSize(); got > MaxFrameSize {
+		t.Fatalf("fit left %d bytes, want <= %d", got, MaxFrameSize)
+	}
+	if f.Message != "http2" {
+		t.Errorf("message: got %q, want %q", f.Message, "http2")
+	}
+	if _, ok := unmarshalAttrs(f.Attrs); !ok {
+		t.Errorf("attrs must remain decodable (len=%d)", len(f.Attrs))
+	}
+}
+
+// TestWriteFrameShortMessageLargeAttrs verifies WriteFrame emits a decodable
+// frame (rather than panicking) when a short message carries a huge attrs value.
+func TestWriteFrameShortMessageLargeAttrs(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fds[0])
+	defer syscall.Close(fds[1])
+	if err := syscall.SetNonblock(fds[1], true); err != nil {
+		t.Fatal(err)
+	}
+
+	attrs := appendAttrSection(nil, []slog.Attr{slog.String("err", strings.Repeat("x", 4*MaxFrameSize))})
+	f := Frame{Version: frameVersion, Level: int(slog.LevelError), Message: "x", Attrs: attrs}
+
+	ok, err := WriteFrame(fds[1], &f)
+	if err != nil || !ok {
+		t.Fatalf("WriteFrame: ok=%v err=%v", ok, err)
+	}
+
+	recv := make([]byte, MaxFrameSize+1024)
+	n, err := syscall.Read(fds[0], recv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Frame
+	if err := got.UnmarshalBinary(recv[:n]); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Message != "x" {
+		t.Errorf("message: got %q, want %q", got.Message, "x")
+	}
+}
+
+// TestFrameLevelRoundTripSign verifies negative levels (Debug) survive the
+// binary encoding.  Decoding the int32 level field as uint32 widened Debug
+// (-4) to a large positive value, so every parent-side level filter saw a
+// Debug record as "at least Error" and rendered it.
+func TestFrameLevelRoundTripSign(t *testing.T) {
+	for _, lvl := range []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError} {
+		f := Frame{Version: frameVersion, Level: int(lvl), Message: "m"}
+		b, err := f.MarshalBinary()
+		if err != nil {
+			t.Fatalf("marshal %d: %v", lvl, err)
+		}
+		var got Frame
+		if err := got.UnmarshalBinary(b); err != nil {
+			t.Fatalf("unmarshal %d: %v", lvl, err)
+		}
+		if got.Level != int(lvl) {
+			t.Errorf("level %d round-tripped to %d", lvl, got.Level)
+		}
 	}
 }

@@ -128,6 +128,17 @@ parse, execute, and stream output from processes:
       root). `WithTag`/`TagCapable`/`TaggedSink` adapt ordinary `slog`
       handlers (a plain `TextHandler` falls back to a group, and `TaggedSink`
       additionally emits a `tag` attribute so the tag stays visible).
+    - **Frame wire format (v2):** records are binary frames. Attrs travel as a
+      compact kind-tagged section (`attrs.go`) rather than JSON, preserving
+      slog kinds and attribute order with no reflection or map allocation;
+      `Frame.Tag` is the display tag path and `Frame.Groups` the attr namespace
+      path. Empty-key attrs are **not dropped**: `slog.Group("", ...)` is an
+      inline group (e.g. `Logger.Log(ctx, lvl, msg, "", group.Value)`), so
+      `appendAttrSection` flattens its members into the parent and elides
+      empty-key non-groups, matching slog's renderers. Oversized frames are
+      shrink-to-fit (message trimmed, long string attrs truncated, then
+      trailing attrs dropped). `IsFramePrefix` still gates the relay on a
+      single version byte.
     - **Stream Lifecycle:** Always call `Close()` after the subprocess exits.
       `Close` stops the drain worker after it has emitted every queued line,
       then flushes any partial last line that lacked a trailing newline.
