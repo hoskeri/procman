@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -46,15 +47,19 @@ func (s StreamKind) String() string {
 // SOCK_SEQPACKET log socket (a child's stdout or stderr in nested mode).
 //
 // The wire format is binary — see MarshalBinary / UnmarshalBinary for the
-// on-the-wire layout.  Attrs are carried as raw JSON bytes (usually nil
-// since the only common attr, "tag", is promoted to the Tag field).
+// on-the-wire layout.  Attrs are carried as raw JSON bytes.
+//
+// Tag and Groups are distinct: Tag is the sender's display tag path (the
+// component path, joined by "/"; the receiving formation prepends its own
+// process tag), while Groups is the slog attribute namespace path used to
+// qualify attrs.  Ordinary process output uses neither.
 type Frame struct {
 	Version   int        // wire version (1)
 	Level     int        // slog.Level as int
-	Tag       string     // process tag (promoted from "tag" attr)
+	Tag       string     // component tag path, "/"-joined (empty = no component)
 	Stream    StreamKind // originating standard stream (stdout/stderr)
 	Message   string     // record message
-	Groups    []string   // handler group path
+	Groups    []string   // attr namespace path (slog WithGroup)
 	AttrsJSON []byte     // raw JSON object "{...}", nil when empty
 }
 
@@ -312,17 +317,28 @@ func ReadFrame(recv *os.File) (f Frame, ok bool, err error) {
 
 // --- FramerHandler: slog.Handler that encodes records as binary frames ---
 
+// LevelResolver maps a relayed record's component tag path (relative to its
+// process tag) to an effective minimum level.  ok is false when no override
+// applies to that identity, in which case the handler's ambient level is used.
+// A nil resolver means "no per-identity policy".  It is how a Formation's
+// LogLevels policy reaches the parent-side sink: the sink passes the full
+// group path minus the leading process tag.
+type LevelResolver func(groups []string) (slog.Level, bool)
+
 // FramerHandler is a slog.Handler that encodes each record as a Frame and
 // writes it to a SOCK_SEQPACKET send socket. It implements the levelSetter
-// interface for per-process log level overrides.
+// interface for per-process log level overrides, TagHandler for the display
+// tag path, and accepts a LevelResolver for per-component overrides.
 type FramerHandler struct {
-	sendFd    int          // raw socket fd (non-blocking SEQPACKET)
-	stream    StreamKind   // stream stamp applied to every frame
-	groupPath []string     // accumulated from WithGroup
-	attrs     []slog.Attr  // accumulated from WithAttrs
-	level     slog.Leveler // base threshold
-	override  slog.Leveler // per-group threshold override (via WithOverride)
-	drops     int64        // total dropped frames (O_NONBLOCK full)
+	sendFd    int           // raw socket fd (non-blocking SEQPACKET)
+	stream    StreamKind    // stream stamp applied to every frame
+	tagPath   []string      // display tag path (via WithTag / TagHandler)
+	groupPath []string      // attr namespace path (via WithGroup)
+	attrs     []slog.Attr   // accumulated from WithAttrs
+	level     slog.Leveler  // base threshold
+	override  slog.Leveler  // per-group threshold override (via WithOverride)
+	resolver  LevelResolver // per-identity threshold policy (via WithResolver)
+	drops     int64         // total dropped frames (O_NONBLOCK full)
 	mu        sync.Mutex
 }
 
@@ -346,25 +362,42 @@ func (h *FramerHandler) clone() *FramerHandler {
 	h2 := &FramerHandler{
 		sendFd:    h.sendFd,
 		stream:    h.stream,
+		tagPath:   append([]string(nil), h.tagPath...),
 		groupPath: append([]string(nil), h.groupPath...),
 		attrs:     append([]slog.Attr(nil), h.attrs...),
 		level:     h.level,
 		override:  h.override,
+		resolver:  h.resolver,
 	}
 	return h2
 }
 
+// RelativeTagPath drops the leading process tag from a sink's tag path.  The
+// formation's sink receives the process tag via TaggedSink/WithTag before any
+// component tags, so the remainder is the component identity the resolver
+// matches against (see process.LogLevels.ForIdentity).
+func RelativeTagPath(tagPath []string) []string {
+	if len(tagPath) > 0 {
+		return tagPath[1:]
+	}
+	return nil
+}
+
 // Enabled determines if the handler is enabled for the given slog.Level.
 func (h *FramerHandler) Enabled(_ context.Context, l slog.Level) bool {
-	if len(h.groupPath) == 0 {
-		// Root un-grouped handler: always enabled (slog may probe it,
-		// but it's never called with actual records since all our
-		// loggers go through WithGroup).
+	if len(h.tagPath) == 0 && len(h.groupPath) == 0 {
+		// Root handler with no tag or group: always enabled (slog may
+		// probe it, but real component loggers carry a tag via WithTag).
 		return true
 	}
 	threshold := h.level.Level()
 	if h.override != nil {
 		threshold = h.override.Level()
+	}
+	if h.resolver != nil {
+		if lvl, ok := h.resolver(RelativeTagPath(h.tagPath)); ok {
+			threshold = lvl
+		}
 	}
 	return l >= threshold
 }
@@ -375,35 +408,24 @@ func (h *FramerHandler) Handle(_ context.Context, rec slog.Record) error {
 		Version: frameVersion,
 		Level:   int(rec.Level),
 		Stream:  h.stream,
+		Tag:     strings.Join(h.tagPath, "/"),
 		Message: rec.Message,
 		Groups:  h.groupPath,
 	}
 
-	// Collect attrs: record attrs + handler attrs.
-	// Extract "tag" into f.Tag, remaining attrs into AttrsJSON.
+	// Collect record attrs + handler attrs.  The display tag is carried
+	// separately in Tag (via WithTag), so a "tag" attr is now just an attr.
 	var allAttrs []slog.Attr
 	rec.Attrs(func(a slog.Attr) bool {
-		if a.Key == "" {
-			return true
+		if a.Key != "" {
+			allAttrs = append(allAttrs, a)
 		}
-		if a.Key == "tag" {
-			f.Tag = a.Value.String()
-			return true
-		}
-		allAttrs = append(allAttrs, a)
 		return true
 	})
 	for _, a := range h.attrs {
-		if a.Key == "" {
-			continue
+		if a.Key != "" {
+			allAttrs = append(allAttrs, a)
 		}
-		if a.Key == "tag" {
-			if f.Tag == "" {
-				f.Tag = a.Value.String()
-			}
-			continue
-		}
-		allAttrs = append(allAttrs, a)
 	}
 
 	if len(allAttrs) > 0 {
@@ -516,10 +538,19 @@ func (h *FramerHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return h2
 }
 
-// WithGroup implements the slog.Handler interface.
+// WithGroup implements the slog.Handler interface.  It records an attribute
+// namespace (carried as Frame.Groups), never the display tag path.
 func (h *FramerHandler) WithGroup(name string) slog.Handler {
 	h2 := h.clone()
 	h2.groupPath = append(h2.groupPath, name)
+	return h2
+}
+
+// WithTag implements the TagHandler interface.  It extends the display tag
+// path, which Handle encodes as Frame.Tag (not as a group).
+func (h *FramerHandler) WithTag(name string) slog.Handler {
+	h2 := h.clone()
+	h2.tagPath = append(h2.tagPath, name)
 	return h2
 }
 
@@ -530,6 +561,16 @@ func (h *FramerHandler) WithGroup(name string) slog.Handler {
 func (h *FramerHandler) WithOverride(name string, lvl slog.Leveler) slog.Handler {
 	h2 := h.clone()
 	h2.override = lvl
+	return h2
+}
+
+// WithResolver implements the resolverSetter interface: returns a handler
+// whose per-identity threshold is resolved from the component tag path
+// (everything after the leading process tag).  A matched override wins over
+// WithOverride; an unmatched path leaves the ambient threshold in place.
+func (h *FramerHandler) WithResolver(resolver LevelResolver) slog.Handler {
+	h2 := h.clone()
+	h2.resolver = resolver
 	return h2
 }
 

@@ -11,7 +11,12 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/hoskeri/procman/pkg/writelog"
 )
+
+// errorLevel is a level resolver that forces Error for every identity.
+func errorLevel([]string) (slog.Level, bool) { return slog.LevelError, true }
 
 // newTestRenderer returns a renderer writing into a buffer, so tests don't
 // need a real *os.File (terminal detection is skipped).
@@ -131,7 +136,7 @@ func TestColumnsTruncationAnsi(t *testing.T) {
 	th, buf := newTestRenderer(slog.LevelInfo)
 	th.opts.Colors = true
 	th.opts.Columns = 21
-	th.groupPath = []string{"web"}
+	th.tagPath = []string{"web"}
 	th.linePrefix = th.buildPrefix()
 
 	rec := slog.NewRecord(time.Time{}, slog.LevelInfo, strings.Repeat("a", 30), 0)
@@ -165,7 +170,7 @@ func TestChildFDsStandaloneText(t *testing.T) {
 	defer stderrR.Close()
 
 	th := New(context.Background(), nil, stdoutW, stderrW, &Options{Plain: true})
-	outFD, errFD, err := th.ChildFDs("web", 0, 0)
+	outFD, errFD, err := th.ChildFDs("web", 0, nil)
 	if err != nil {
 		t.Fatalf("ChildFDs: %v", err)
 	}
@@ -205,7 +210,7 @@ func TestChildFDsStandaloneText(t *testing.T) {
 	}
 }
 
-// TestChildFDsLevelOverride verifies that a per-process level passed to
+// TestChildFDsLevelOverride verifies that a per-process resolver passed to
 // ChildFDs is applied to the relayed records.
 func TestChildFDsLevelOverride(t *testing.T) {
 	stdoutR, stdoutW, err := os.Pipe()
@@ -215,7 +220,7 @@ func TestChildFDsLevelOverride(t *testing.T) {
 	defer stdoutR.Close()
 
 	th := New(context.Background(), nil, stdoutW, stdoutW, &Options{})
-	outFD, errFD, err := th.ChildFDs("web", 0, slog.LevelError)
+	outFD, errFD, err := th.ChildFDs("web", 0, errorLevel)
 	if err != nil {
 		t.Fatalf("ChildFDs: %v", err)
 	}
@@ -231,6 +236,89 @@ func TestChildFDsLevelOverride(t *testing.T) {
 	}
 }
 
+// TestChildFDsComponentLevelOverride verifies that the resolver is consulted
+// per relayed record using the component tag path: an override for one
+// component applies while other components keep the ambient level.
+func TestChildFDsComponentLevelOverride(t *testing.T) {
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdoutR.Close()
+
+	th := New(context.Background(), nil, stdoutW, stdoutW, &Options{})
+	resolver := func(groups []string) (slog.Level, bool) {
+		if len(groups) > 0 && groups[0] == "validate" {
+			return slog.LevelError, true
+		}
+		return slog.LevelInfo, false
+	}
+	outFD, errFD, err := th.ChildFDs("webhook", 0, resolver)
+	if err != nil {
+		t.Fatalf("ChildFDs: %v", err)
+	}
+
+	framer := writelog.NewFramer(writelog.SetupSendSocket(int(outFD.Fd())), writelog.StreamStdout, slog.LevelDebug)
+	logger := slog.New(framer)
+	validateLog := writelog.WithTag(logger, "validate")
+	validateLog.Info("validate-info")                    // suppressed by component override
+	validateLog.Error("validate-error")                  // shown
+	writelog.WithTag(logger, "audit").Info("audit-info") // shown at ambient Info
+
+	errFD.Close()
+	outFD.Close()
+	th.Close()
+	stdoutW.Close()
+
+	out, _ := io.ReadAll(stdoutR)
+	s := string(out)
+	if strings.Contains(s, "validate-info") {
+		t.Errorf("validate Info should be suppressed by the component override, got %q", s)
+	}
+	for _, want := range []string{"validate-error", "audit-info", "webhook/validate"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("expected %q in output, got %q", want, s)
+		}
+	}
+}
+
+// TestChildFDsRendersAttrs verifies that slog attributes survive the relay and
+// are rendered (logfmt) after the message, with the display tag as the prefix
+// and slog groups as attr namespaces -- the whole point of the tag/group split.
+func TestChildFDsRendersAttrs(t *testing.T) {
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdoutR.Close()
+
+	th := New(context.Background(), nil, stdoutW, stdoutW, &Options{})
+	outFD, errFD, err := th.ChildFDs("webhook", 0, nil)
+	if err != nil {
+		t.Fatalf("ChildFDs: %v", err)
+	}
+
+	framer := writelog.NewFramer(writelog.SetupSendSocket(int(outFD.Fd())), writelog.StreamStdout, slog.LevelDebug)
+	writelog.WithTag(slog.New(framer), "audit").Info("admission audit", "ev", "content")
+	writelog.WithTag(slog.New(framer), "api").WithGroup("req").Info("handled", "id", 42)
+
+	errFD.Close()
+	outFD.Close()
+	th.Close()
+	stdoutW.Close()
+
+	out, _ := io.ReadAll(stdoutR)
+	s := string(out)
+	for _, want := range []string{
+		"webhook/audit | admission audit ev=content",
+		"webhook/api | handled req.id=42",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, s)
+		}
+	}
+}
+
 // TestChildFDsCloseRace exercises ChildFDs concurrently with Close, guarding
 // the wg.Add/wg.Wait ordering and the closed flag.  Run with -race.
 func TestChildFDsCloseRace(t *testing.T) {
@@ -241,7 +329,7 @@ func TestChildFDsCloseRace(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				out, errOut, err := th.ChildFDs("web", 0, 0)
+				out, errOut, err := th.ChildFDs("web", 0, nil)
 				if err != nil {
 					return
 				}

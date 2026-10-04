@@ -160,12 +160,16 @@ func TestIsFramePrefix(t *testing.T) {
 type captureHandler struct {
 	fn    func(context.Context, slog.Record) error
 	attrs []slog.Attr
+	tags  []string // display tag path (via WithTag)
 }
 
 func (h *captureHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
 func (h *captureHandler) Handle(ctx context.Context, r slog.Record) error {
 	if len(h.attrs) > 0 {
 		r.AddAttrs(h.attrs...)
+	}
+	if len(h.tags) > 0 {
+		r.AddAttrs(slog.String("__tagpath", strings.Join(h.tags, "/")))
 	}
 	return h.fn(ctx, r)
 }
@@ -175,6 +179,11 @@ func (h *captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &h2
 }
 func (h *captureHandler) WithGroup(_ string) slog.Handler { return h }
+func (h *captureHandler) WithTag(name string) slog.Handler {
+	h2 := *h
+	h2.tags = append(append([]string(nil), h.tags...), name)
+	return &h2
+}
 
 // TestFramerEnabledLevel is a regression test for NewFramer dropping the
 // caller-supplied level: a nil level made FramerHandler.Enabled panic as soon
@@ -241,11 +250,11 @@ func TestFramerRelayRoundTrip(t *testing.T) {
 
 	time.Sleep(10 * time.Millisecond) // let relay goroutine start
 
-	// Use FramerHandler to write a frame
+	// Use FramerHandler to write a frame under the display tag "child".
 	framer := NewFramer(sendFd, StreamStdout, slog.LevelInfo)
-	framer = framer.WithGroup("child").WithAttrs([]slog.Attr{slog.Int("count", 7)}).(*FramerHandler)
+	framer = framer.WithTag("child").WithAttrs([]slog.Attr{slog.Int("count", 7)}).(*FramerHandler)
 	framerLogger := slog.New(framer)
-	framerLogger.With(slog.String("tag", "child")).Warn("hello from child")
+	framerLogger.Warn("hello from child")
 
 	syscall.Close(sendFd)
 	relayWg.Wait()
@@ -265,15 +274,11 @@ func TestFramerRelayRoundTrip(t *testing.T) {
 		t.Errorf("level: got %v, want %v", r.Level, slog.LevelWarn)
 	}
 
-	var tagSeen string
-	r.Attrs(func(a slog.Attr) bool {
-		if a.Key == "tag" {
-			tagSeen = a.Value.String()
-		}
-		return true
-	})
-	if tagSeen != "child" {
-		t.Errorf("tag attr: got %q, want %q", tagSeen, "child")
+	if got := attrString(r, "__tagpath"); got != "parent/child" {
+		t.Errorf("tag path: got %q, want %q", got, "parent/child")
+	}
+	if got := attrString(r, "count"); got != "7" {
+		t.Errorf("count attr: got %q, want 7", got)
 	}
 }
 

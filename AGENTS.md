@@ -63,17 +63,21 @@ parse, execute, and stream output from processes:
     to **`pkg/procfile`**; `Load` converts the parsed records into `Process`
     structs wired to the formation's `Workdir`.
     - Takes a `process.LogSink` (`Logger() *slog.Logger` + `ChildFDs(tag,
-      index, level)`) as `Formation.Logs`. `Run` asks the sink for per-child
+      index, resolver)`) as `Formation.Logs`. `Run` asks the sink for per-child
       stdout/stderr descriptors and wires them into each `exec.Cmd`; the sink
       (e.g. `*termhandler.TermHandler`) owns the transport, root/nested
       detection, and relays. When `Logs` is nil, output falls back to the
       `writelog` text pipeline into `slog.Default()`.
     - `Formation.LogLevels` (`process.LogLevels`) carries a default log level
-      plus per-tag overrides. `Run` resolves each process's level with
-      explicit `Process.LogLevel` > tag override > default, and passes it to
-      `ChildFDs`. `process.ParseLogLevels(spec, def)` parses the
-      `"info,api=debug"` CLI form and seeds `def` so an overrides-only spec
-      keeps the caller's default.
+      plus overrides. `Run` passes the sink a `writelog.LevelResolver` built
+      from `Process.LogLevel` (which wins) and `LogLevels.ForIdentity`; the
+      sink consults it per relayed record, so an override may name a process
+      tag (`webhook`), a full component path (`webhook/validate`), or the
+      component alone (`validate`). `process.ParseLogLevels(spec, def)` parses
+      the `"info,api=debug"` CLI form and seeds `def` so an overrides-only spec
+      keeps the caller's default. Overrides for tags that match none of those
+      forms are ignored (resolution falls through to Default / the ambient
+      sink level).
     - Orchestrates execution inside `Run(ctx)`. Processes are started in
       parallel using an **`golang.org/x/sync/errgroup.Group`**.
     - **Crucial Behavior:** Under the `errgroup`, if any single process exits
@@ -116,11 +120,28 @@ parse, execute, and stream output from processes:
       the child process.
     - `Stream(sink, tag, lvl, StreamConfig)` returns an `io.WriteCloser`.
       `StreamConfig.MaxQueue` bounds the queue (`<= 0` = default).
-    - **Tagging:** Every logged line includes the process tag as a group and
-      attribute (`tag="web"`), guaranteeing proper tracing.
+    - **Tag path vs. attribute groups:** `writelog` separates a record's
+      display **tag path** from its slog **attribute groups**. `TagHandler`
+      (`WithTag`) extends the display path — rendered as the prefix and
+      carried as `Frame.Tag` — while `WithGroup` always denotes an attribute
+      namespace (carried as `Frame.Groups`, and used to qualify attrs at the
+      root). `WithTag`/`TagCapable`/`TaggedSink` adapt ordinary `slog`
+      handlers (a plain `TextHandler` falls back to a group, and `TaggedSink`
+      additionally emits a `tag` attribute so the tag stays visible).
     - **Stream Lifecycle:** Always call `Close()` after the subprocess exits.
       `Close` stops the drain worker after it has emitted every queued line,
       then flushes any partial last line that lacked a trailing newline.
+    - **In-process component tagging:** `TaggedLogger(tag string) *slog.Logger`
+      (in `tagged.go`) exposes the nested framing multiplexer to code that
+      does not run a formation. It probes fd 1/2 for a parent's log channel;
+      when nested it sets the record's display tag (`WithTag`) so the parent
+      renders the component as `<process>/<tag>` (e.g. `webhook/authn`) and
+      preserves the record's attrs. It reuses an already-installed
+      `FramerHandler` default (as procman's own `main` sets) before probing,
+      and otherwise falls back to `slog.Default().WithGroup(tag)` so it is safe
+      stand-alone. The parent resolves the level per component from the tag
+      path, so overrides may name the process tag (`webhook`), the full path
+      (`webhook/validate`), or the component alone (`validate`).
 
 
 ### D. Output Facade (`pkg/termhandler`)
@@ -133,19 +154,29 @@ parse, execute, and stream output from processes:
     - Owns **terminal state**: on the first tty stream (stdin preferred) it
       calls `NoEcho` and restores termios on `Close`; the `ctx` triggers
       `Close` via `context.AfterFunc`.
-    - Owns **child channels**: `ChildFDs(tag, index, level)` creates a
+    - Owns **child channels**: `ChildFDs(tag, index, resolver)` creates a
       per-child `SOCK_SEQPACKET` socketpair, starts a `DualRelay` into the
-      matching sink, and returns child stdout/stderr `*os.File`s. A positive
+      matching sink, and returns child stdout/stderr `*os.File`s. The
+      `writelog.LevelResolver` is attached to the sink handler
+      (`WithResolver`), whose `Enabled` consults it with the record's
+      component tag path (the tag path minus the leading process tag); a
+      matched override wins over `WithOverride` and `Options.Level`. A positive
       `index` becomes a `tag-index` identity for replicas. `Close` drains
       relays, then force-closes after a grace period.
     - `Options.Plain` selects a plain `slog.TextHandler` renderer instead of
       the colored one (`--output auto` on a pipe); `Options.Colors` forces
       color (`--output term`).
 - **`renderer`** (unexported): the historical `slog.Handler` that prefixes
-  each line with a bold, tag-derived color label. Checks
-  `terminal.IsTerminal` for auto color, truncates to `Options.Columns`, and
-  hashes the tag with FNV-1a for a consistent palette entry. Prefixes are
-  padded to 16 columns (e.g. `             web | `).
+  each line with a bold, tag-derived color label and renders attributes in
+  logfmt after the message. Checks `terminal.IsTerminal` for auto color,
+  truncates to `Options.Columns`, and hashes the innermost tag with FNV-1a for
+  a consistent palette entry. Prefixes are padded to 16 columns (e.g.
+  `             web | `). `WithTag` extends the display tag path and recomputes
+  the prefix; `WithGroup` records an attr namespace only. `Handle` takes a fast
+  path (raw message, no formatting) when the record has no attrs and no attr
+  namespaces, so high-volume process output is unaffected; otherwise a
+  stripped-down `slog.TextHandler` formats the attrs, with the synthetic
+  `tag`/`stream` attrs filtered out.
 
 
 ## 4. Helper Tools & Diagnostics

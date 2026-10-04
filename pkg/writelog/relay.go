@@ -87,10 +87,9 @@ func dualRelayLoop(recv *net.UnixConn, parentSink *slog.Logger, childTag string,
 	buf := make([]byte, MaxFrameSize+1024)
 	var tb textBuf
 
-	// Pre-allocate a logger for text lines (childTag group only).  Text has
-	// no frame, so its stream is known from the channel it was read on.
-	textLogger := parentSink.WithGroup(childTag).With(
-		slog.String("tag", childTag),
+	// Pre-allocate a logger for text lines (display tag only).  Text has no
+	// frame, so its stream is known from the channel it was read on.
+	textLogger := TaggedSink(parentSink, childTag).With(
 		slog.String("stream", channelStream.String()),
 	)
 
@@ -132,12 +131,12 @@ func dualRelayLoop(recv *net.UnixConn, parentSink *slog.Logger, childTag string,
 	}
 }
 
-// emitRelayedFrame re-emits a decoded frame into the parent sink with
-// proper group nesting.  The frame's own Stream is preserved; when it is
-// absent (an older/foreign sender) channelStream is used instead.  The
-// stream is attached as a "stream" attribute so stream-aware rendering can
-// use it later; the termhandler ignores attrs, so current rendering is
-// unchanged.
+// emitRelayedFrame re-emits a decoded frame into the parent sink.  The
+// process tag (childTag) and the frame's component tag path become the display
+// tag path, while frame.Groups become attr namespaces.  The frame's own Stream
+// is preserved; when it is absent (an older/foreign sender) channelStream is
+// used instead.  The stream is attached as a "stream" attribute so
+// stream-aware rendering can use it later; the terminal renderer filters it.
 func emitRelayedFrame(parentSink *slog.Logger, childTag string, channelStream StreamKind, frame Frame) {
 	if frame.Message == "" {
 		return
@@ -146,9 +145,18 @@ func emitRelayedFrame(parentSink *slog.Logger, childTag string, channelStream St
 		frame.Stream = channelStream
 	}
 
-	// Build the group chain: childTag + frame.Groups (the child's own
-	// group path from its framer handler).
-	logger := parentSink.WithGroup(childTag)
+	tagCapable := TagCapable(parentSink)
+
+	// Display tag path: process tag + the frame's component path.
+	logger := TaggedSink(parentSink, childTag)
+	if frame.Tag != "" {
+		for _, t := range strings.Split(frame.Tag, "/") {
+			if t != "" {
+				logger = WithTag(logger, t)
+			}
+		}
+	}
+	// Attr namespaces (not display tags).
 	for _, g := range frame.Groups {
 		logger = logger.WithGroup(g)
 	}
@@ -166,7 +174,9 @@ func emitRelayedFrame(parentSink *slog.Logger, childTag string, channelStream St
 			}
 		}
 	}
-	if frame.Tag != "" {
+	// Plain (non-tag-capable) sinks have no prefix, so keep the component tag
+	// visible as an attribute, matching the historical behavior.
+	if !tagCapable && frame.Tag != "" {
 		attrs = append(attrs, slog.String("tag", frame.Tag))
 	}
 	attrs = append(attrs, slog.String("stream", frame.Stream.String()))

@@ -46,8 +46,10 @@ type LogSink interface {
 	// Logger returns the sink for the formation's own lifecycle records.
 	Logger() *slog.Logger
 	// ChildFDs returns the child-side stdout and stderr descriptors for a
-	// process; the caller owns and closes them after the process exits.
-	ChildFDs(tag string, index int, level slog.Level) (stdout, stderr *os.File, err error)
+	// process; the caller owns and closes them after the process exits.  The
+	// resolver carries the formation's log-level policy so the sink can apply
+	// per-component overrides to relayed records.
+	ChildFDs(tag string, index int, resolver writelog.LevelResolver) (stdout, stderr *os.File, err error)
 }
 
 // Formation is the set of process from a procfile.
@@ -131,6 +133,22 @@ func (p *Process) logLevel(levels LogLevels) slog.Level {
 	return levels.For(p.Tag)
 }
 
+// resolver returns the per-identity log-level policy for p.  An explicit
+// Process.LogLevel wins for every record; otherwise the formation's LogLevels
+// policy is consulted with the record's component tag path, so overrides can
+// name the process tag ("webhook"), the full path ("webhook/validate"), or the
+// component alone ("validate").  See LogLevels.ForIdentity.
+func (p *Process) resolver(levels LogLevels) writelog.LevelResolver {
+	explicit := p.LogLevel
+	tag := p.Tag
+	return func(groups []string) (slog.Level, bool) {
+		if explicit != 0 {
+			return explicit, true
+		}
+		return levels.ForIdentity(tag, groups)
+	}
+}
+
 // applies reports whether levels overrides anything for p (i.e. the formation
 // carries an explicit policy rather than the zero value).
 func (levels LogLevels) applies(p *Process) bool {
@@ -208,7 +226,9 @@ func (l *Formation) Run(ctx context.Context) error {
 	if l.Logs != nil {
 		base = l.Logs.Logger()
 	}
-	procmanLog := base.WithGroup("procman")
+	// The formation's own lifecycle records are tagged "procman" (a display
+	// tag, not an attribute namespace) so the renderer prefixes them.
+	procmanLog := writelog.WithTag(base, "procman")
 
 	// Create one child channel per process per stream.  The LogSink owns the
 	// transport: it may render text to a terminal or frame records up to a
@@ -221,7 +241,7 @@ func (l *Formation) Run(ctx context.Context) error {
 	ios := make([]childIO, len(l.Processes))
 	if l.Logs != nil {
 		for i, p := range l.Processes {
-			stdout, stderr, err := l.Logs.ChildFDs(p.Tag, p.Index, p.logLevel(l.LogLevels))
+			stdout, stderr, err := l.Logs.ChildFDs(p.Tag, p.Index, p.resolver(l.LogLevels))
 			if err != nil {
 				for j := range i {
 					ios[j].stdout.Close()

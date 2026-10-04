@@ -89,6 +89,46 @@ func TestLogLevelsFor(t *testing.T) {
 	}
 }
 
+// TestLogLevelsForIdentity verifies that an override can name the process tag,
+// the full path, or the component alone, and that unknown tags are ignored.
+func TestLogLevelsForIdentity(t *testing.T) {
+	l := LogLevels{
+		Default: slog.LevelWarn,
+		Tags: map[string]slog.Level{
+			"webhook":          slog.LevelInfo,
+			"webhook/validate": slog.LevelError,
+			"audit":            slog.LevelDebug,
+		},
+	}
+
+	tests := []struct {
+		name   string
+		proc   string
+		groups []string
+		want   slog.Level
+		wantOK bool
+	}{
+		{"process tag only", "webhook", nil, slog.LevelInfo, true},
+		{"full path beats component and process", "webhook", []string{"validate"}, slog.LevelError, true},
+		{"component alone", "webhook", []string{"audit"}, slog.LevelDebug, true},
+		{"unmatched identity falls to default", "other", []string{"nope"}, slog.LevelWarn, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := l.ForIdentity(tt.proc, tt.groups)
+			if got != tt.want || ok != tt.wantOK {
+				t.Errorf("ForIdentity(%q, %v) = (%v, %v), want (%v, %v)", tt.proc, tt.groups, got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+
+	// Unknown override tags match nothing: the zero default reports no policy.
+	unknown := LogLevels{Tags: map[string]slog.Level{"ghost": slog.LevelDebug}}
+	if got, ok := unknown.ForIdentity("webhook", []string{"validate"}); ok || got != 0 {
+		t.Errorf("unknown-tag ForIdentity = (%v, %v), want (0, false)", got, ok)
+	}
+}
+
 // TestProcessLogLevelPrecedence verifies explicit Process.LogLevel beats the
 // formation's tag override and default, and that an unset process defers to
 // the formation.

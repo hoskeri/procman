@@ -15,6 +15,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/hoskeri/procman/pkg/termhandler"
+	"github.com/hoskeri/procman/pkg/writelog"
 )
 
 func TestProcess(t *testing.T) {
@@ -135,7 +136,7 @@ type discardSink struct{}
 
 func (discardSink) Logger() *slog.Logger { return discardLogger() }
 
-func (discardSink) ChildFDs(tag string, index int, level slog.Level) (*os.File, *os.File, error) {
+func (discardSink) ChildFDs(tag string, index int, resolver writelog.LevelResolver) (*os.File, *os.File, error) {
 	stdout, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
 		return nil, nil, err

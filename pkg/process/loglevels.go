@@ -18,7 +18,9 @@ type LogLevels struct {
 	// Default applies to any tag without an override.  The zero value is
 	// slog.LevelInfo.
 	Default slog.Level
-	// Tags maps a process tag to its override.
+	// Tags maps a log identity to its override.  Identity keys may be a
+	// process tag ("webhook"), a full component path ("webhook/validate"), or
+	// a component name alone ("validate"); see ForIdentity.
 	Tags map[string]slog.Level
 }
 
@@ -29,6 +31,35 @@ func (l LogLevels) For(tag string) slog.Level {
 		return lvl
 	}
 	return l.Default
+}
+
+// ForIdentity returns the effective level and whether an override applies for
+// a relayed record's identity: the process tag plus zero or more component
+// group names.  It matches, in order of specificity:
+//
+//	webhook/validate   full path
+//	validate           component path (all groups joined)
+//	webhook            process tag
+//
+// and falls back to Default.  ok is false when nothing matches and Default is
+// the zero value, so the caller keeps its ambient level.  Override entries for
+// tags that match none of these forms are ignored.
+func (l LogLevels) ForIdentity(processTag string, groups []string) (slog.Level, bool) {
+	var candidates []string
+	if component := strings.Join(groups, "/"); component != "" {
+		candidates = append(candidates, processTag+"/"+component, component)
+	}
+	candidates = append(candidates, processTag)
+
+	for _, key := range candidates {
+		if key == "" {
+			continue
+		}
+		if lvl, ok := l.Tags[key]; ok {
+			return lvl, true
+		}
+	}
+	return l.Default, l.Default != 0
 }
 
 // ParseLevel parses a level name accepted by ParseLogLevels: error, warn,

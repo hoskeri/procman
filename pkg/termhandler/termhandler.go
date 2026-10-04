@@ -10,6 +10,7 @@
 package termhandler
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -141,10 +142,12 @@ type Options struct {
 	Plain bool
 }
 
-// levelSetter is implemented by slog.Handlers that can produce per-group
-// handlers with an overridden minimum log level (renderer and FramerHandler).
-type levelSetter interface {
-	WithOverride(name string, lvl slog.Leveler) slog.Handler
+// resolverSetter is implemented by slog.Handlers that accept a per-identity
+// level policy (renderer and writelog.FramerHandler).  The sink resolves the
+// threshold from the component tag path, so a single process can carry
+// different levels for its components.
+type resolverSetter interface {
+	WithResolver(resolver writelog.LevelResolver) slog.Handler
 }
 
 // TerminalWidth reports the width in columns of f when it is a terminal, or 0
@@ -238,12 +241,14 @@ func noEchoFirst(files ...*os.File) func() {
 // detail of the TermHandler facade.
 type renderer struct {
 	opts       Options
-	groupPath  []string     // accumulated group path (innermost is last)
-	override   slog.Leveler // per-process level threshold (via WithOverride)
-	color      string       // ANSI color for the innermost group
+	tagPath    []string               // display tag path (innermost is last)
+	groupPath  []string               // attr namespace path (innermost is last)
+	override   slog.Leveler           // per-process level threshold (via WithOverride)
+	resolver   writelog.LevelResolver // per-identity threshold policy (via WithResolver)
+	color      string                 // ANSI color for the innermost tag
 	attrs      []slog.Attr
 	palette    []string // ANSI prefixes selected by colorSupport
-	linePrefix string   // cached render of the full group path
+	linePrefix string   // cached render of the tag path
 	prefixVis  int      // visible width of linePrefix (see buildPrefix)
 	mu         *sync.Mutex
 	out        io.Writer
@@ -278,18 +283,18 @@ func (h *renderer) colorFor(tag string) string {
 	return h.palette[int(hv.Sum32())%len(h.palette)]
 }
 
-// buildPrefix returns the full group path prefix for the current groupPath,
-// optionally colored. Groups are joined with "/" — the restricted tag
+// buildPrefix returns the display tag prefix for the current tagPath,
+// optionally colored. Tags are joined with "/" — the restricted tag
 // character set (lowercase alphanumeric + dash) guarantees no ambiguity.
 func (h *renderer) buildPrefix() string {
-	// innermost group for color
+	// innermost tag for color
 	innermost := ""
-	if len(h.groupPath) > 0 {
-		innermost = h.groupPath[len(h.groupPath)-1]
+	if len(h.tagPath) > 0 {
+		innermost = h.tagPath[len(h.tagPath)-1]
 	}
 
-	// Combine all groups into a single path, right-justified in 16 columns.
-	combined := strings.Join(h.groupPath, "/")
+	// Combine all tags into a single path, right-justified in 16 columns.
+	combined := strings.Join(h.tagPath, "/")
 	padded := fmt.Sprintf("%16s", shortenMiddle(combined, 16))
 	// The uncolored prefix is padded (always exactly 16 ASCII bytes, since
 	// tags are restricted to lowercase alphanumerics and dashes) plus
@@ -331,39 +336,65 @@ func (h *renderer) WithOverride(name string, lvl slog.Leveler) slog.Handler {
 	return h2
 }
 
+// WithResolver implements the resolverSetter interface.  The resolver is
+// consulted in Enabled with the component tag path (everything after the
+// leading process tag); a matched override wins over WithOverride and the
+// ambient Options.Level.
+func (h *renderer) WithResolver(resolver writelog.LevelResolver) slog.Handler {
+	h2 := h.clone()
+	h2.resolver = resolver
+	return h2
+}
+
+// WithTag implements writelog.TagHandler.  It extends the display tag path and
+// recomputes the prefix/color; slog WithGroup no longer affects the prefix.
+func (h *renderer) WithTag(name string) slog.Handler {
+	h2 := h.clone()
+	h2.tagPath = append(h2.tagPath, name)
+	h2.linePrefix = h2.buildPrefix()
+	return h2
+}
+
 func (h *renderer) clone() *renderer {
 	h2 := *h
+	h2.tagPath = append([]string(nil), h.tagPath...)
 	h2.groupPath = append([]string(nil), h.groupPath...)
 	h2.attrs = append([]slog.Attr(nil), h.attrs...)
 	return &h2
 }
 
 func (h *renderer) Enabled(ctx context.Context, l slog.Level) bool {
-	if len(h.groupPath) == 0 {
-		// Bare root handler — not yet associated with any process group; slog
-		// never calls Handle on it.
+	if len(h.tagPath) == 0 && len(h.groupPath) == 0 {
+		// Bare root handler — no display tag or attr group yet; slog never
+		// calls Handle on it.
 		return false
 	}
 	threshold := h.opts.Level
 	if h.override != nil {
 		threshold = h.override
 	}
+	if h.resolver != nil {
+		if lvl, ok := h.resolver(writelog.RelativeTagPath(h.tagPath)); ok {
+			threshold = lvl
+		}
+	}
 	return l >= threshold.Level()
 }
 
 func (h *renderer) Handle(ctx context.Context, rec slog.Record) error {
-	if rec.Message == "" {
+	if rec.Message == "" && len(h.attrs) == 0 && rec.NumAttrs() == 0 {
 		return nil
 	}
 
-	// Trim the message *before* prepending the colored prefix: the prefix's
+	msg := h.renderPayload(ctx, rec)
+
+	// Trim the payload *before* prepending the colored prefix: the prefix's
 	// visible width is fixed (prefixVis), so the budget left for the payload
 	// is Columns minus that. No escape scanning is needed — the ANSI codes
 	// are added afterwards and never land in the trimmed region. Escapes
 	// inside child output still count as bytes here (they are rare, and a
 	// cut inside one is self-healing: an ESC begins every new line and
 	// aborts any dangling sequence).
-	msg := rec.Message
 	if h.opts.Columns > 0 {
 		avail := max(h.opts.Columns-h.prefixVis, 0)
 		if len(msg) > avail {
@@ -372,6 +403,9 @@ func (h *renderer) Handle(ctx context.Context, rec slog.Record) error {
 	}
 
 	out := []byte(h.linePrefix + msg)
+	if len(out) == 0 {
+		return nil
+	}
 	if out[len(out)-1] != '\n' {
 		out = append(out, '\n')
 	}
@@ -382,17 +416,79 @@ func (h *renderer) Handle(ctx context.Context, rec slog.Record) error {
 	return err
 }
 
+// renderPayload returns the record's message plus its attributes rendered in
+// slog's logfmt style.  The fast path (no attrs and no attr namespaces) returns
+// the message unchanged, so high-volume raw process output pays no formatting
+// cost.  Attributes are rendered with a stripped-down slog.TextHandler so
+// quoting, value kinds, and nested groups are handled by the standard library.
+// The synthetic tag/stream attrs added by the relay are not displayed (the tag
+// is the prefix; the stream is metadata).
+func (h *renderer) renderPayload(ctx context.Context, rec slog.Record) string {
+	if len(h.attrs) == 0 && len(h.groupPath) == 0 && rec.NumAttrs() == 0 {
+		return rec.Message
+	}
+
+	opts := &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			switch a.Key {
+			case slog.TimeKey, slog.LevelKey:
+				if len(groups) == 0 {
+					return slog.Attr{}
+				}
+			case "tag", "stream":
+				// Synthetic attrs added by the relay; the tag is the prefix
+				// and the stream is metadata.  Reserved names.
+				return slog.Attr{}
+			}
+			return a
+		},
+	}
+
+	var buf bytes.Buffer
+	var hh slog.Handler = slog.NewTextHandler(&buf, opts)
+	for _, g := range h.groupPath {
+		hh = hh.WithGroup(g)
+	}
+	if len(h.attrs) > 0 {
+		hh = hh.WithAttrs(h.attrs)
+	}
+
+	// Format attrs only, then strip TextHandler's always-present empty msg.
+	r := slog.NewRecord(time.Time{}, rec.Level, "", 0)
+	rec.Attrs(func(a slog.Attr) bool {
+		r.AddAttrs(a)
+		return true
+	})
+	if err := hh.Handle(ctx, r); err != nil {
+		return rec.Message
+	}
+
+	attrs := strings.TrimSpace(buf.String())
+	attrs = strings.TrimSpace(strings.TrimPrefix(attrs, `msg=""`))
+	if attrs == "" {
+		return rec.Message
+	}
+	if rec.Message == "" {
+		return attrs
+	}
+	if strings.HasSuffix(rec.Message, "\n") {
+		return strings.TrimSuffix(rec.Message, "\n") + " " + attrs + "\n"
+	}
+	return rec.Message + " " + attrs
+}
+
 func (h *renderer) WithAttrs(attrs []slog.Attr) slog.Handler {
 	h2 := h.clone()
 	h2.attrs = append(h2.attrs, attrs...)
 	return h2
 }
 
+// WithGroup implements the slog.Handler interface.  It records an attribute
+// namespace (used to qualify attrs) and never changes the display prefix.
 func (h *renderer) WithGroup(name string) slog.Handler {
-	// Append the new group to the path and recompute prefix/color.
 	h2 := h.clone()
 	h2.groupPath = append(h2.groupPath, name)
-	h2.linePrefix = h2.buildPrefix()
 	return h2
 }
 
@@ -498,19 +594,22 @@ func (h *TermHandler) Nested() bool { return h.nested }
 // has exited (the relay exits on EOF, or on Close).
 //
 // tag and index identify the process; a positive index is folded into the
-// identity ("web-2") so replicas get distinct prefixes and colors.  level is
-// the process's per-stream log level override (0 means inherit).
-func (h *TermHandler) ChildFDs(tag string, index int, level slog.Level) (stdout, stderr *os.File, err error) {
+// identity ("web-2") so replicas get distinct prefixes and colors.  resolver
+// is the process's log-level policy: the parent-side sink consults it per
+// record with the component tag path, so component overrides layer on top of
+// the process tag and formation default.  A nil resolver leaves the sink's own
+// level in place.
+func (h *TermHandler) ChildFDs(tag string, index int, resolver writelog.LevelResolver) (stdout, stderr *os.File, err error) {
 	identity := tag
 	if index > 0 {
 		identity = fmt.Sprintf("%s-%d", tag, index)
 	}
 
-	stdout, err = h.openChannel(identity, writelog.StreamStdout, childSink(h.outHandler, level))
+	stdout, err = h.openChannel(identity, writelog.StreamStdout, childSink(h.outHandler, resolver))
 	if err != nil {
 		return nil, nil, err
 	}
-	stderr, err = h.openChannel(identity, writelog.StreamStderr, childSink(h.errHandler, level))
+	stderr, err = h.openChannel(identity, writelog.StreamStderr, childSink(h.errHandler, resolver))
 	if err != nil {
 		stdout.Close()
 		return nil, nil, err
@@ -606,12 +705,12 @@ func (h *TermHandler) openChannel(tag string, stream writelog.StreamKind, sink *
 	return os.NewFile(uintptr(fds[1]), fmt.Sprintf("%s-%s", stream, tag)), nil
 }
 
-// childSink applies a per-process level override to a handler when the handler
-// supports it (renderer / FramerHandler).  A zero level means "no override".
-func childSink(handler slog.Handler, level slog.Level) *slog.Logger {
-	if level != 0 {
-		if ls, ok := handler.(levelSetter); ok {
-			handler = ls.WithOverride("", level)
+// childSink applies a per-identity level policy to a handler when the handler
+// supports it (renderer / FramerHandler).  A nil resolver means "no policy".
+func childSink(handler slog.Handler, resolver writelog.LevelResolver) *slog.Logger {
+	if resolver != nil {
+		if rs, ok := handler.(resolverSetter); ok {
+			handler = rs.WithResolver(resolver)
 		}
 	}
 	return slog.New(handler)

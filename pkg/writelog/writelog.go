@@ -200,7 +200,7 @@ func Stream(sink *slog.Logger, tag string, lvl slog.Level, cfg StreamConfig) io.
 
 	s := &stream{
 		buf:  bytes.NewBuffer(make([]byte, 0, 256)),
-		sink: sink.WithGroup(tag).With(slog.Attr{Key: "tag", Value: slog.StringValue(tag)}),
+		sink: TaggedSink(sink, tag),
 		lvl:  lvl,
 		ring: make([]string, maxQ),
 		maxQ: maxQ,
