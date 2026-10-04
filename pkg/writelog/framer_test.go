@@ -559,7 +559,7 @@ func TestRelayTeardown(t *testing.T) {
 	sink := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	var wg sync.WaitGroup
-	DualRelay(recvConn, sink, "teardown-test", StreamStdout, &wg)
+	DualRelay(recvConn, sink, "teardown-test", StreamStdout, &wg, nil)
 
 	time.Sleep(10 * time.Millisecond) // let it start
 

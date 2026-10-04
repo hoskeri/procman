@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/hoskeri/procman/pkg/procfile"
+	"github.com/hoskeri/procman/pkg/status"
 	"github.com/hoskeri/procman/pkg/writelog"
 )
 
@@ -35,6 +36,17 @@ type Process struct {
 	// wins over Formation.LogLevels; the zero value (slog.LevelInfo) means
 	// "unset" and defers to the formation's default/tag override.
 	LogLevel slog.Level
+	// Status, when non-nil, is polled on the formation's status interval to
+	// answer "is this component working?".  A nil return means healthy; a
+	// non-nil one is classified by status.FromError into starting /
+	// degraded / unhealthy (recoverable) / failed (fatal) and published to the
+	// formation's status registry and log stream.
+	//
+	// A process status never ends the formation by itself — only the
+	// Formation's own Status callback can do that (see Formation.Status).  The
+	// poll slows to a backoff while the component is unhealthy, and stops
+	// once the process is gone.
+	Status func(ctx context.Context) error
 }
 
 // LogSink is the formation's output destination.  It provides the logger for
@@ -64,6 +76,25 @@ type Formation struct {
 	// then Default.  The zero value leaves output at the sink's own level
 	// (Default=Info, no overrides).
 	LogLevels LogLevels
+	// Status, when non-nil, is the formation's own health policy: it is
+	// called on each status tick with the aggregate view of every process,
+	// and its verdict ends the formation.
+	//
+	// Returning a fatal *status.Error (status.Failed / StateFailed) ends Run
+	// and is returned to the caller, with the siblings torn down exactly as
+	// they are when a process exits.  Returning nil, or any other error
+	// (including a recoverable status such as status.Unhealthy), only updates
+	// the reported state — the formation keeps waiting.  This is the only way
+	// status can bring a formation down, which is what lets a component report
+	// a recoverable problem without risking its siblings.
+	Status func(ctx context.Context) error
+	// StatusInterval, StatusBackoff and StatusBackoffMax tune status polling;
+	// the zero values are DefaultStatusInterval, DefaultStatusBackoff and
+	// DefaultStatusBackoffMax.  They are ignored when no Process or the
+	// Formation has a Status callback.
+	StatusInterval   time.Duration
+	StatusBackoff    time.Duration
+	StatusBackoffMax time.Duration
 }
 
 // New parses a new procfile formatted specification.
@@ -253,6 +284,33 @@ func (l *Formation) Run(ctx context.Context) error {
 		}
 	}
 
+	// Status: one track per process (created up front so a process that dies
+	// before its first poll still has a row), a poller per Process.Status, and
+	// the formation's own policy callback in the same errgroup — a fatal
+	// verdict there cancels the formation exactly like a process exit.
+	var (
+		tracks   []*statusTrack
+		rec      statusRecorder
+		pollWait func()
+		sctx     context.Context
+		scancel  context.CancelFunc
+	)
+	if l.hasStatus() {
+		tracks = make([]*statusTrack, len(l.Processes))
+		for i := range tracks {
+			tracks[i] = newStatusTrack()
+		}
+		rec = statusRecorder{log: writelog.WithTag(base, "procman/status")}
+		if ss, ok := l.Logs.(StatusSink); ok {
+			rec.sink = ss
+		}
+		// Status goroutines get their own cancel so they can be stopped (and
+		// waited for) before Run returns, without cancelling the caller's ctx.
+		sctx, scancel = context.WithCancel(ctx)
+		pollWait = l.startStatusPollers(sctx, tracks, rec, base)
+		defer scancel()
+	}
+
 	for i, p := range l.Processes {
 		ch := ios[i]
 		p := p
@@ -270,7 +328,21 @@ func (l *Formation) Run(ctx context.Context) error {
 				withStdoutFile(ch.stdout),
 				withStderrFile(ch.stderr),
 				withLogger(logger),
+				withOnStart(func(pid int) {
+					if rec.sink != nil {
+						rec.sink.ProcessStarted(status.Identity(p.Tag, p.Index), pid)
+					}
+					if tracks != nil {
+						tracks[i].started(pid)
+					}
+				}),
 			)
+			if tracks != nil {
+				tracks[i].exitedProcess(exitCodeOf(err))
+				if rec.sink != nil {
+					rec.sink.ProcessExited(status.Identity(p.Tag, p.Index), exitCodeOf(err))
+				}
+			}
 			if err != nil {
 				procmanLog.Warn(err.Error())
 			}
@@ -278,7 +350,35 @@ func (l *Formation) Run(ctx context.Context) error {
 		})
 	}
 
-	return eg.Wait()
+	if l.Status != nil && tracks != nil {
+		eg.Go(func() error {
+			err := l.formationStatusLoop(sctx, tracks, rec)
+			if err != nil {
+				procmanLog.Error("formation status", "err", err)
+			}
+			return err
+		})
+	}
+
+	err := eg.Wait()
+	if pollWait != nil {
+		if scancel != nil {
+			scancel()
+		}
+		pollWait()
+	}
+	return err
+}
+
+// exitCodeOf extracts the exit code carried by a process's error, or -1 when
+// there is none (a launch failure, or a sibling brought the formation down
+// before this process exited on its own).
+func exitCodeOf(err error) int {
+	var ee *ExitError
+	if errors.As(err, &ee) {
+		return ee.Code
+	}
+	return -1
 }
 
 type runOptions struct {
@@ -287,6 +387,7 @@ type runOptions struct {
 	envAdd     []string
 	stdoutFile *os.File // when set, used as the child's stdout (instead of writelog.Stream)
 	stderrFile *os.File // when set, used as the child's stderr (instead of writelog.Stream)
+	onStart    func(pid int)
 }
 
 func (ro *runOptions) Apply(os ...runOption) {
@@ -351,6 +452,16 @@ func withStdoutFile(f *os.File) runOption {
 func withStderrFile(f *os.File) runOption {
 	return func(o *runOptions) {
 		o.stderrFile = f
+	}
+}
+
+// withOnStart registers a callback invoked with the child's pid once it has
+// started (and before it is waited on).  Formation.Run uses it to publish
+// process liveness into the status registry, so a component is observable as
+// StateUnknown-with-a-pid from the moment it exists.
+func withOnStart(fn func(pid int)) runOption {
+	return func(o *runOptions) {
+		o.onStart = fn
 	}
 }
 
@@ -430,7 +541,15 @@ func (p *Process) run(ctx context.Context, opt ...runOption) error {
 	}
 
 	slog.Debug("c.run", "c.args", p.CmdArgs)
-	err := c.Run()
+	// Start/Wait are separated (instead of c.Run) so onStart can publish the
+	// pid, and so the reap is observed at exactly the moment it happens.
+	if err := c.Start(); err != nil {
+		return pf(p.Tag, err)
+	}
+	if o.onStart != nil {
+		o.onStart(c.Process.Pid)
+	}
+	err := c.Wait()
 	slog.Debug("c.exit", "err", err)
 	// A canceled context here means this process did not stop on its own: the
 	// formation was torn down (user interrupt, or a sibling exiting first) and

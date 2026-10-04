@@ -27,6 +27,7 @@ import (
 
 	"github.com/nerdmaster/terminal"
 
+	"github.com/hoskeri/procman/pkg/status"
 	"github.com/hoskeri/procman/pkg/writelog"
 )
 
@@ -422,11 +423,22 @@ func (h *renderer) Handle(ctx context.Context, rec slog.Record) error {
 // cost.  Attributes are rendered with a stripped-down slog.TextHandler so
 // quoting, value kinds, and nested groups are handled by the standard library.
 // The synthetic tag/stream attrs added by the relay are not displayed (the tag
-// is the prefix; the stream is metadata).
+// is the prefix; the stream is metadata), and neither are the reserved status
+// attrs: the state is folded into the message instead, as a leading label
+// ("UNHEALTHY etcd unreachable"), so the wire message stays clean for the
+// status registry.
 func (h *renderer) renderPayload(ctx context.Context, rec slog.Record) string {
 	if len(h.attrs) == 0 && len(h.groupPath) == 0 && rec.NumAttrs() == 0 {
 		return rec.Message
 	}
+
+	label := ""
+	rec.Attrs(func(a slog.Attr) bool {
+		if a.Key == writelog.AttrStatus && a.Value.Kind() == slog.KindString {
+			label = strings.ToUpper(a.Value.String()) + " "
+		}
+		return true
+	})
 
 	opts := &slog.HandlerOptions{
 		Level: slog.LevelDebug,
@@ -436,9 +448,17 @@ func (h *renderer) renderPayload(ctx context.Context, rec slog.Record) string {
 				if len(groups) == 0 {
 					return slog.Attr{}
 				}
+			case writelog.AttrStatus:
+				// Folded into the message as a leading label above.
+				return slog.Attr{}
 			case "tag", "stream":
 				// Synthetic attrs added by the relay; the tag is the prefix
 				// and the stream is metadata.  Reserved names.
+				return slog.Attr{}
+			case "since", "detail":
+				// Status records carry the state in the rendered message
+				// (see Reporter.report), so the reserved status attrs would
+				// only duplicate it.  Reserved names.
 				return slog.Attr{}
 			}
 			return a
@@ -466,16 +486,28 @@ func (h *renderer) renderPayload(ctx context.Context, rec slog.Record) string {
 
 	attrs := strings.TrimSpace(buf.String())
 	attrs = strings.TrimSpace(strings.TrimPrefix(attrs, `msg=""`))
-	if attrs == "" {
-		return rec.Message
+
+	msg := rec.Message
+	switch {
+	case attrs == "":
+	case msg == "":
+		msg = attrs
+	case strings.HasSuffix(msg, "\n"):
+		msg = strings.TrimSuffix(msg, "\n") + " " + attrs + "\n"
+	default:
+		msg = msg + " " + attrs
 	}
-	if rec.Message == "" {
-		return attrs
+	// A status record leads with its state: "UNHEALTHY etcd unreachable".
+	// The wire message itself stays clean, so the parent registry can use it
+	// as the reason verbatim.
+	if label != "" {
+		trailing := ""
+		if rest, ok := strings.CutSuffix(msg, "\n"); ok {
+			msg, trailing = rest, "\n"
+		}
+		msg = label + msg + trailing
 	}
-	if strings.HasSuffix(rec.Message, "\n") {
-		return strings.TrimSuffix(rec.Message, "\n") + " " + attrs + "\n"
-	}
-	return rec.Message + " " + attrs
+	return msg
 }
 
 func (h *renderer) WithAttrs(attrs []slog.Attr) slog.Handler {
@@ -521,6 +553,7 @@ type TermHandler struct {
 
 	restore func()
 	relays  *relayState
+	status  *statusRegistry
 }
 
 // New builds the output facade for a formation.
@@ -534,7 +567,7 @@ type TermHandler struct {
 // instead of rendering.  stderr is probed independently; when it is not a
 // socket, stderr frames are sent on the stdout channel.
 func New(ctx context.Context, stdin, stdout, stderr *os.File, opts *Options) *TermHandler {
-	h := &TermHandler{relays: &relayState{}}
+	h := &TermHandler{relays: &relayState{}, status: newStatusRegistry()}
 	var o Options
 	if opts != nil {
 		o = *opts
@@ -587,6 +620,62 @@ func (h *TermHandler) ErrLogger() *slog.Logger {
 // Nested reports whether the process was started by a parent formation (its
 // stdout is a log socket).
 func (h *TermHandler) Nested() bool { return h.nested }
+
+// Statuses returns the current status of every component in the formation,
+// sorted by identity.  See StatusStore.
+func (h *TermHandler) Statuses() []status.Snapshot {
+	if h.status == nil {
+		return nil
+	}
+	return h.status.all()
+}
+
+// Status returns the current status of one identity ("api", "api-2",
+// "webhook/validate"); ok is false when nothing is known about it.
+func (h *TermHandler) Status(identity string) (status.Snapshot, bool) {
+	if h.status == nil {
+		return status.Snapshot{}, false
+	}
+	return h.status.snapshot(identity)
+}
+
+// ObserveStatus implements writelog.StatusObserver: it records a status that
+// arrived on a child channel, including from a nested formation relaying its
+// own children's statuses.
+func (h *TermHandler) ObserveStatus(identity string, rec writelog.StatusRecord) {
+	if h.status == nil {
+		return
+	}
+	h.status.observe(identity, rec)
+}
+
+// ReportStatus publishes a status produced inside this process (a Process's
+// Status callback, or a component holding a status.Reporter that shares this
+// process's sink).
+func (h *TermHandler) ReportStatus(identity string, e *status.Error) {
+	if h.status == nil {
+		return
+	}
+	h.status.report(identity, e)
+}
+
+// ProcessStarted records a process identity with its unix pid, so an
+// unreported process shows up as StateUnknown rather than as missing.  It is
+// the process-level half of the writelog.StatusObserver implementation.
+func (h *TermHandler) ProcessStarted(identity string, pid int) {
+	if h.status == nil {
+		return
+	}
+	h.status.processStarted(identity, pid)
+}
+
+// ProcessExited records a reaped process and its exit code (-1 when unknown).
+func (h *TermHandler) ProcessExited(identity string, code int) {
+	if h.status == nil {
+		return
+	}
+	h.status.processExited(identity, code)
+}
 
 // ChildFDs creates the child-side stdout and stderr descriptors for a process
 // and starts the parent-side relays into this handler.  The caller wires the
@@ -699,7 +788,7 @@ func (h *TermHandler) openChannel(tag string, stream writelog.StreamKind, sink *
 	// ordered before Close's wg.Wait.  Close flips closed under this same
 	// lock and only starts Wait after releasing it, so either this Add is
 	// visible to Wait or the closed check above rejects the channel.
-	writelog.DualRelay(recv, sink, tag, stream, &h.relays.wg)
+	writelog.DualRelay(recv, sink, tag, stream, &h.relays.wg, statusObserver{h.status})
 	h.relays.mu.Unlock()
 
 	return os.NewFile(uintptr(fds[1]), fmt.Sprintf("%s-%s", stream, tag)), nil

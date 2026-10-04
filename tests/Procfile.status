@@ -1,0 +1,6 @@
+# Sample Procfile for the status integration tests: a statuz fixture reports
+# component status while it keeps running, and a sleeper keeps the formation up
+# long enough for the sequence to be observed.  @STATUZ@ is substituted with
+# the prebuilt statuz path by the harness (tests/integration_test.go).
+web: "@STATUZ@" -tag serve -sequence healthy,degraded,unhealthy,healthy -interval 50ms
+work: sleep 5

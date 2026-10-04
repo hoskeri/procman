@@ -27,10 +27,14 @@ minimal, embeddable alternative to tools like [Foreman][foreman].
 │   ├── termhandler/          # Output facade: terminal rendering + child log channels
 │   │   ├── termhandler.go    # renderer (colored prefixes) + TermHandler facade (ChildFDs)
 │   │   └── termhandler_test.go
+│   ├── status/              # Health vocabulary: State, *Error, Snapshot, Reporter
+│   │   ├── status.go        # States + classification, sentinels, Snapshot
+│   │   └── reporter.go      # TaggedReporter / Reporter (child-side push API)
 │   └── writelog/             # Stream adapters, framers, and relays to slog
 │       ├── writelog.go       # Bounded queue; splits streams by newline for slog
 │       ├── framer.go         # Binary SOCK_SEQPACKET frames + FramerHandler
 │       ├── relay.go          # DualRelay (frame or text) + ChildSinks probe
+│       ├── status.go         # Reserved status attrs + StatusObserver wire contract
 │       └── *_test.go
 ├── tests/                    # Integration tests + sample Procfiles
 │   ├── integration_test.go   # Execs the built procman/trebuchet (PROCMAN_BIN)
@@ -93,6 +97,26 @@ parse, execute, and stream output from processes:
       initiated (context canceled by a signal handler), `Run` returns `nil`.
       `pf` attributes the exit; launch failures are tagged with the process
       name and returned as plain errors.
+    - **Status (see `docs/STATUS.md`):** `Process.Status func(ctx) error` and
+      `Formation.Status func(ctx) error`, with `StatusInterval` /
+      `StatusBackoff` / `StatusBackoffMax` (5s / 1s / 30s). A process callback
+      is polled per process, classified with `status.FromError`, published to
+      the sink (`StatusSink`: `ReportStatus` / `ProcessStarted` /
+      `ProcessExited`) and logged as a record. **A process status never ends
+      the formation**; only `Formation.Status` returning a fatal
+      (`status.Failed`) verdict does, and that comes back from `Run` as a
+      `*status.Error` with the siblings torn down exactly as on an exit. The
+      callback receives the aggregate via `StatusViewFromContext(ctx)`
+      (`StatusView.Components`, each with `State`, `Fatal`, `Recoverable`, and
+      the unix `PID`/`Exited`/`ExitCode`), so the embedder writes the policy.
+      A healthy component is re-polled at `StatusInterval`, a recoverable
+      failure backs off from `StatusBackoff`, and a fatal one is re-checked at
+      `StatusBackoffMax` (its cause may be external) until the process is
+      reaped — a `statusTrack`'s `done` channel, closed by the process
+      goroutine, is what makes "the process is gone" authoritative (no
+      `signal 0`, so pid recycling cannot fool it). Status goroutines have
+      their own cancel and are waited for after `eg.Wait()`. With no callbacks
+      at all, nothing is started (`Formation.hasStatus`).
 
 
 ### B. Procfile Parsing (`pkg/procfile`)
@@ -153,6 +177,45 @@ parse, execute, and stream output from processes:
       stand-alone. The parent resolves the level per component from the tag
       path, so overrides may name the process tag (`webhook`), the full path
       (`webhook/validate`), or the component alone (`validate`).
+    - **Status on the wire:** a status is an *ordinary framed record* — no new
+      frame format. It carries two or three reserved attrs alongside `tag` and
+      `stream`: `status` (`pkg/status.State.String()`: `unknown`,
+      `unknown-process`, `starting`, `healthy`, `degraded`, `unhealthy`,
+      `failed`), optional `detail`, and optional `since` (a duration). The
+      record message stays the clean reason. `DualRelay(..., obs ...StatusObserver)`
+      decodes those attrs into a `writelog.StatusRecord` and hands them to the
+      observer under `childTag + "/" + frame.Tag`, *and* still re-emits the
+      record into the parent sink, so statuses render like logs and are
+      independent of level filtering. `pkg/writelog` stays free of
+      `pkg/status`: the state is still a string at that boundary.
+
+
+### C2. Status Vocabulary (`pkg/status`)
+
+- **`State`** (`unknown`, `unknown-process`, `starting`, `healthy`, `degraded`,
+  `unhealthy`, `failed`): `Recoverable()` is true for everything except
+  `failed` — that single bit answers "should the supervisor keep waiting?".
+  `Reported()` is false for the two unknown states, which are inferred from
+  process liveness rather than reported. `Level()` maps a state onto a
+  `slog.Level` (healthy=Debug, starting=Info, degraded=Warn,
+  unhealthy/failed=Error), so status output obeys the usual level policy.
+- **`*status.Error`** is the canonical status error (nil = healthy):
+  `State`/`Reason`/`Detail`/`Err`/`Since`/`Attrs`, per-state constructors
+  (`Healthy`, `Starting`, `Degraded`, `Unhealthy`, `Failed`, `Wrap`), and
+  `FromError(err)` which classifies any error (nil -> healthy, a plain error ->
+  recoverable unhealthy). `errors.Is(err, status.ErrFailed)` matches any fatal
+  status. It is also a `slog.LogValuer`.
+- **`Reporter`** (in `reporter.go`) is the push-side twin of a `Status`
+  callback: `OK`/`Starting`/`Degraded`/`Unhealthy`/`Failed`/`Report`, plus a
+  local `Snapshot()`. `TaggedReporter(tag)` mirrors `writelog.TaggedLogger` (it
+  is built on the exported `writelog.ChildLogger`), so a sub-component in a
+  non-procman process degrades safely to `slog.Default()`. Repeating an
+  unchanged state+reason is suppressed, so a polling component does not flood
+  the log.
+- **`Snapshot`** is one component's latest state, including process liveness
+  (`PID`, `Exited`, `ExitCode`) and a `Since` that is never zero for a
+  registry row. `Identity(tag, index)` builds the `api` / `api-2` path.
+- See `docs/STATUS.md` for the full design and the as-built deltas.
 
 
 ### D. Output Facade (`pkg/termhandler`)
@@ -174,6 +237,14 @@ parse, execute, and stream output from processes:
       matched override wins over `WithOverride` and `Options.Level`. A positive
       `index` becomes a `tag-index` identity for replicas. `Close` drains
       relays, then force-closes after a grace period.
+    - Owns the **status registry** (in `status.go`): `Statuses()` /
+      `Status(identity)` (`StatusStore`) plus the `process.StatusSink` methods
+      `ProcessStarted`, `ProcessExited`, `ReportStatus`. A row is created when a
+      process starts (`StateUnknown` + pid) and updated at the reap, so "alive
+      but silent", "reported", and "gone without a word" are all
+      distinguishable; sub-component rows inherit their process's liveness and
+      are marked exited with it. Rows are never deleted and are **not** gated by
+      log levels. The registry is a mutex-guarded map: no goroutine, no timer.
     - `Options.Plain` selects a plain `slog.TextHandler` renderer instead of
       the colored one (`--output auto` on a pipe); `Options.Colors` forces
       color (`--output term`).

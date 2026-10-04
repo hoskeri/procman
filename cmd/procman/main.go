@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/hoskeri/procman/pkg/process"
+	"github.com/hoskeri/procman/pkg/status"
 	"github.com/hoskeri/procman/pkg/termhandler"
 	"github.com/spf13/pflag"
 )
@@ -30,7 +31,7 @@ func (p *procFlags) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVarP(&p.Dotenv, "env", "e", "", "path to dotenv style env file")
 	fs.StringVar(&p.Formation, "formation", "", "optional map of process type=replica-count")
 	fs.StringVar(&p.Output, "output", "auto", "output mode: auto,term")
-	fs.IntVar(&p.Columns, "columns", 0, "truncate log lines to this many characters (0 = terminal width, <0 = off)")
+	fs.IntVar(&p.Columns, "columns", 0, "truncate log lines to this many characters (0 = terminal width, <0 = no truncation)")
 	fs.BoolVar(&p.Debug, "debug", false, "enable debug logging")
 }
 
@@ -92,8 +93,7 @@ func main() {
 		// A process that exited on its own determines the formation's status:
 		// its exit code is the exit code of procman itself. A non-ExitError
 		// (e.g. an executable that failed to launch) is a setup failure -> 1.
-		var pe *process.ExitError
-		if errors.As(err, &pe) {
+		if pe, ok := errors.AsType[*process.ExitError](err); ok {
 			lv := slog.LevelError
 			if pe.Code == 0 {
 				// Clean self-exit: the formation came down on its own, not by
@@ -103,6 +103,13 @@ func main() {
 			slog.Log(ctx, lv, "fm.Run", "err", err)
 			logs.Close()
 			os.Exit(pe.Code)
+		}
+		// A fatal formation status: the formation's own Status policy decided
+		// no component was worth waiting on any longer.
+		if se, ok := errors.AsType[*status.Error](err); ok && se.Fatal() {
+			slog.Error("fm.Run", "err", err, "status", se.State.String())
+			logs.Close()
+			os.Exit(1)
 		}
 		slog.Error("fm.Run", "err", err)
 		logs.Close()

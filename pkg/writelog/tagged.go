@@ -27,6 +27,15 @@ import "log/slog"
 // override may name the process tag ("webhook"), the full path
 // ("webhook/validate"), or the component alone ("validate").
 func TaggedLogger(tag string) *slog.Logger {
+	return ChildLogger(tag)
+}
+
+// ChildLogger is TaggedLogger under the name that describes it for non-log
+// callers: it returns the process's child-side log channel with the component
+// display tag applied, whether the process is nested in a parent formation or
+// not.  status.TaggedReporter is built on it, so status records ride exactly
+// the same channel and framing as log records.
+func ChildLogger(tag string) *slog.Logger {
 	return taggedLogger(tag, ChildSinks)
 }
 

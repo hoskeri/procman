@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // SetupRecvConn wraps a raw SOCK_SEQPACKET socket fd into a *net.UnixConn
@@ -24,6 +25,30 @@ func SetupRecvConn(fd int) *net.UnixConn {
 
 // --- Dual relay: frame or text ---
 
+// StatusRecord is a status decoded from a relayed frame, in wire terms (no
+// domain types, so pkg/writelog stays independent of pkg/status).
+type StatusRecord struct {
+	// State is the reserved AttrStatus value ("healthy", "unhealthy", ...).
+	State string
+	// Reason is the record message.
+	Reason string
+	// Detail is the optional reserved AttrDetail attribute.
+	Detail string
+	// Since is how long the sender has held the state (0 when unknown).
+	Since time.Duration
+}
+
+// StatusObserver receives every status that arrives on a child channel, after
+// the frame is decoded and before (independently of) it is re-emitted into the
+// parent's sink.  termhandler.TermHandler implements it to maintain the
+// formation's status registry.  A nil observer means "ignore statuses".
+//
+// Registration is independent of log levels: a healthy status that the
+// level policy filtered out of the log stream still reaches the observer.
+type StatusObserver interface {
+	ObserveStatus(identity string, rec StatusRecord)
+}
+
 // DualRelay reads messages from recv and dispatches each to either the frame
 // path (parsed and re-emitted into parentSink with group nesting) or the text
 // path (split on newlines and logged as text under childTag).  channelStream
@@ -35,16 +60,23 @@ func SetupRecvConn(fd int) *net.UnixConn {
 // This avoids any frame-decode overhead on text messages.
 //
 // wg is optional; when non-nil, Add(1) is called before the loop and Done
-// after it exits.
-func DualRelay(recv *net.UnixConn, parentSink *slog.Logger, childTag string, channelStream StreamKind, wg *sync.WaitGroup) {
+// after it exits.  obs is optional; when set it receives the status records
+// carried by relayed frames.
+func DualRelay(recv *net.UnixConn, parentSink *slog.Logger, childTag string, channelStream StreamKind, wg *sync.WaitGroup, obs ...StatusObserver) {
 	if wg != nil {
 		wg.Add(1)
+	}
+	var observer StatusObserver
+	for _, o := range obs {
+		if o != nil {
+			observer = o
+		}
 	}
 	go func() {
 		if wg != nil {
 			defer wg.Done()
 		}
-		dualRelayLoop(recv, parentSink, childTag, channelStream)
+		dualRelayLoop(recv, parentSink, childTag, channelStream, observer)
 	}()
 }
 
@@ -81,7 +113,7 @@ func (tb *textBuf) flush(emit func(line string)) {
 	}
 }
 
-func dualRelayLoop(recv *net.UnixConn, parentSink *slog.Logger, childTag string, channelStream StreamKind) {
+func dualRelayLoop(recv *net.UnixConn, parentSink *slog.Logger, childTag string, channelStream StreamKind, obs StatusObserver) {
 	buf := make([]byte, MaxFrameSize+1024)
 	var tb textBuf
 
@@ -120,6 +152,11 @@ func dualRelayLoop(recv *net.UnixConn, parentSink *slog.Logger, childTag string,
 				continue
 			}
 			emitRelayedFrame(parentSink, childTag, channelStream, frame)
+			if obs != nil {
+				if rec, ok := frameStatus(frame); ok {
+					obs.ObserveStatus(joinIdentity(childTag, frame.Tag), rec)
+				}
+			}
 		} else {
 			// Text from a non-procman child.
 			tb.feed(string(msg), func(line string) {
@@ -135,6 +172,55 @@ func dualRelayLoop(recv *net.UnixConn, parentSink *slog.Logger, childTag string,
 // is preserved; when it is absent (an older/foreign sender) channelStream is
 // used instead.  The stream is attached as a "stream" attribute so
 // stream-aware rendering can use it later; the terminal renderer filters it.
+// joinIdentity combines a process tag with a frame's component tag path into
+// the identity used by the status registry and the log level resolver's path
+// convention: "webhook" + "validate" -> "webhook/validate".
+func joinIdentity(childTag, frameTag string) string {
+	if frameTag == "" {
+		return childTag
+	}
+	if childTag == "" {
+		return frameTag
+	}
+	return childTag + "/" + frameTag
+}
+
+// frameStatus extracts the status reserved attributes from a decoded frame.  It
+// is a cheap scan of the decoded attrs: absent (the common case for ordinary
+// log records) it returns immediately.
+func frameStatus(frame Frame) (StatusRecord, bool) {
+	if len(frame.Attrs) == 0 {
+		return StatusRecord{}, false
+	}
+	attrs, ok := unmarshalAttrs(frame.Attrs)
+	if !ok {
+		return StatusRecord{}, false
+	}
+	// The record message is the status reason: the state travels in the
+	// reserved attr, the human text in the message (unchanged from the wire
+	// format for logs).
+	rec := StatusRecord{Reason: frame.Message}
+	var found bool
+	for _, a := range attrs {
+		switch a.Key {
+		case AttrStatus:
+			if v, ok := a.Value.Any().(string); ok {
+				rec.State = v
+				found = true
+			}
+		case AttrDetail:
+			if v, ok := a.Value.Any().(string); ok {
+				rec.Detail = v
+			}
+		case AttrSince:
+			if d, ok := a.Value.Any().(time.Duration); ok && d > 0 {
+				rec.Since = d
+			}
+		}
+	}
+	return rec, found
+}
+
 func emitRelayedFrame(parentSink *slog.Logger, childTag string, channelStream StreamKind, frame Frame) {
 	if frame.Message == "" {
 		return
@@ -148,7 +234,7 @@ func emitRelayedFrame(parentSink *slog.Logger, childTag string, channelStream St
 	// Display tag path: process tag + the frame's component path.
 	logger := TaggedSink(parentSink, childTag)
 	if frame.Tag != "" {
-		for _, t := range strings.Split(frame.Tag, "/") {
+		for t := range strings.SplitSeq(frame.Tag, "/") {
 			if t != "" {
 				logger = WithTag(logger, t)
 			}

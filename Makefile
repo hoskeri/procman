@@ -8,10 +8,11 @@ GOARCH ?= $(shell $(GO) env GOARCH)
 OUT      := $(CURDIR)/_output/$(GOOS)_$(GOARCH)/bin
 PROCMAN  := $(OUT)/procman
 TREBUCHET := $(OUT)/trebuchet
+STATUZ    := $(OUT)/statuz
 
 .PHONY: build test clean
 
-build: $(PROCMAN) $(TREBUCHET)
+build: $(PROCMAN) $(TREBUCHET) $(STATUZ)
 
 $(PROCMAN): $(shell find cmd pkg -name '*.go') go.mod go.sum
 	@mkdir -p $(OUT)
@@ -20,6 +21,12 @@ $(PROCMAN): $(shell find cmd pkg -name '*.go') go.mod go.sum
 $(TREBUCHET): $(shell find tools/trebuchet -name '*.go') go.mod go.sum
 	@mkdir -p $(OUT)
 	$(GO) build -o $(TREBUCHET) ./tools/trebuchet
+
+# statuz is the status-reporting fixture: a child that publishes component
+# status through status.TaggedReporter and keeps running.
+$(STATUZ): $(shell find tools/statuz -name '*.go') go.mod go.sum
+	@mkdir -p $(OUT)
+	$(GO) build -o $(STATUZ) ./tools/statuz
 
 # Build everything once, then run unit and integration tests. PROCMAN_BIN
 # points the integration tests (pkg tests/.../*_test.go) at the prebuilt

@@ -335,3 +335,109 @@ work: sh -c 'sleep 0.2; echo work-out'`)
 		t.Errorf("no web-err frame on stderr; got %+v", stderrFrames)
 	}
 }
+
+// stripANSI removes color escape sequences so assertions can match rendered
+// text regardless of the color mode procman ran in.
+func stripANSI(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b {
+			for i < len(s) && s[i] != 'm' {
+				i++
+			}
+			i++ // skip the terminating 'm'
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+// statuzPath is the status-reporting fixture sitting next to procman.
+func statuzPath(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(filepath.Dir(procmanBin(t)), "statuz")
+}
+
+// TestStatusReportedThroughChildChannel runs a real formation whose child
+// publishes component status through status.TaggedReporter: the records cross
+// the SOCK_SEQPACKET channel and are rendered by the parent formation with the
+// state as a leading label.  A process-level Status callback on the *parent*
+// side is not involved here — this is the child-push path end to end.
+func TestStatusReportedThroughChildChannel(t *testing.T) {
+	raw, err := os.ReadFile("Procfile.status")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	pf := writeProcfile(t, strings.ReplaceAll(string(raw), "@STATUZ@", statuzPath(t)))
+
+	cmd := exec.Command(procmanBin(t), "-f", pf, "--output", "term", "--columns", "-1")
+	var out, errOut bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errOut
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start procman: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	// Let the sequence run: healthy (Debug), degraded, unhealthy, healthy.
+	time.Sleep(600 * time.Millisecond)
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatalf("SIGINT: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		<-done
+		t.Fatal("procman did not exit after SIGINT")
+	}
+
+	s := stripANSI(out.String() + errOut.String())
+	t.Logf("procman output:\n%s", s)
+
+	// The child's tag ("serve") is the process tag; the report is made under a
+	// component tag, so the parent renders it as "<process>/<component>".
+	for _, want := range []string{
+		"web/serve | DEGRADED fixture: slow",
+		"web/serve | UNHEALTHY fixture: dependency unreachable",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, s)
+		}
+	}
+	// Healthy is logged at Debug, so it must NOT appear at the default level
+	// (while UNHEALTHY, which contains "HEALTHY" as a substring, does), and the
+	// reserved status attrs must never leak into the rendered line.
+	if strings.Contains(s, "| HEALTHY ") {
+		t.Errorf("healthy statuses are Debug-level and should be filtered:\n%s", s)
+	}
+	if strings.Contains(s, "status=unhealthy") || strings.Contains(s, "status=degraded") {
+		t.Errorf("reserved status attrs leaked into the rendered line:\n%s", s)
+	}
+}
+
+// TestStatusDoesNotMaskExit: a child that reports a fatal status and then exits
+// still ends the formation as an exit — status reporting never replaces exit
+// semantics.
+func TestStatusDoesNotMaskExit(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "Procfile")
+	text := strings.ReplaceAll(`
+web: "@STATUZ@" -tag serve -sequence failed -interval 50ms -exit-when-failed
+work: sleep 30
+`, "@STATUZ@", statuzPath(t))
+	if err := os.WriteFile(real, []byte(text), 0o644); err != nil {
+		t.Fatalf("write Procfile: %v", err)
+	}
+
+	_, stderr, exit := runProcman(t, real)
+	if exit != 1 {
+		t.Errorf("expected exit 1 from the failing child, got %d (stderr: %s)", exit, stderr)
+	}
+	if !strings.Contains(stderr, "web exited, exit code 1") {
+		t.Errorf("expected the exit to be attributed to web, got: %s", stderr)
+	}
+}
