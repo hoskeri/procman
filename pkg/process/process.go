@@ -135,6 +135,7 @@ func (l *Formation) Load(src io.ReadCloser) error {
 
 	ps := []*Process{}
 	for _, r := range records {
+		// TODO tag validation should be in procfile parsing.
 		if !validTag(r.Tag) {
 			return fmt.Errorf("process tag %q: must be lowercase alphanumeric (may contain dashes)", r.Tag)
 		}
@@ -374,8 +375,7 @@ func (l *Formation) Run(ctx context.Context) error {
 // there is none (a launch failure, or a sibling brought the formation down
 // before this process exited on its own).
 func exitCodeOf(err error) int {
-	var ee *ExitError
-	if errors.As(err, &ee) {
+	if ee, ok := errors.AsType[*ExitError](err); ok {
 		return ee.Code
 	}
 	return -1
@@ -437,6 +437,7 @@ func withExtraFiles(files []*os.File) runOption {
 	}
 }
 
+// TODO withEnvAdd is unused, and unusable from outside?
 func withEnvAdd(entries []string) runOption {
 	return func(o *runOptions) {
 		o.envAdd = entries

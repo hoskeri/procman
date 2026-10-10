@@ -263,10 +263,10 @@ func (l *Formation) pollLoop(ctx context.Context, p *Process, t *statusTrack, re
 		t.report(e)
 		rec.report(status.Identity(p.Tag, p.Index), e)
 
-		switch {
-		case e.State == status.StateHealthy || e.State == status.StateStarting:
+		switch e.State {
+		case status.StateHealthy, status.StateStarting:
 			delay = interval
-		case e.State == status.StateFailed:
+		case status.StateFailed:
 			// Terminal-looking, but the cause may be external: keep
 			// checking slowly rather than freezing the state.
 			delay = l.statusBackoffMax()
@@ -339,11 +339,9 @@ func (l *Formation) startStatusPollers(ctx context.Context, tracks []*statusTrac
 		if base != nil {
 			r.log = writelog.WithTag(base, status.Identity(p.Tag, p.Index)+"/status")
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			l.pollLoop(ctx, p, tracks[i], r)
-		}()
+		})
 	}
 	return wg.Wait
 }
