@@ -483,6 +483,14 @@ func (h *FramerHandler) Handle(_ context.Context, rec slog.Record) error {
 	return nil
 }
 
+// emitStatus writes a status record regardless of the level policy (see
+// EmitStatus).  It is the framer's statusEmitter implementation: the record
+// still carries the reserved status attrs, and the parent's relay observes it
+// independently of whether the parent renders the line.
+func (h *FramerHandler) emitStatus(rec slog.Record) {
+	_ = h.Handle(context.Background(), rec)
+}
+
 func isEAGAIN(err error) bool {
 	if err == nil {
 		return false

@@ -64,6 +64,19 @@ type LogSink interface {
 	ChildFDs(tag string, index int, resolver writelog.LevelResolver) (stdout, stderr *os.File, err error)
 }
 
+// ChildStatusSource is implemented by a LogSink that can forward statuses
+// relayed from child processes to an additional observer.  A formation uses
+// it to fold a child's sub-component statuses into its own status view, so a
+// process that does not probe itself but whose real components run deeper (a
+// supervisor such as a node) still converges to a status instead of staying
+// unknown forever.  termhandler.TermHandler implements it.
+type ChildStatusSource interface {
+	// AddStatusObserver registers o to receive every status relayed from a
+	// child's log channel.  Callers must register before that child's
+	// descriptors are created (ChildFDs) so no early status is missed.
+	AddStatusObserver(o writelog.StatusObserver)
+}
+
 // Formation is the set of process from a procfile.
 type Formation struct {
 	Workdir   string
@@ -262,6 +275,42 @@ func (l *Formation) Run(ctx context.Context) error {
 	// tag, not an attribute namespace) so the renderer prefixes them.
 	procmanLog := writelog.WithTag(base, "procman")
 
+	// Status: one track per process (created up front so a process that dies
+	// before its first poll still has a row), a poller per Process.Status, and
+	// the formation's own policy callback in the same errgroup — a fatal
+	// verdict there cancels the formation exactly like a process exit.
+	//
+	// This runs before the child channels are created so the relay hook below
+	// is in place before any child status can arrive (see ChildStatusSource).
+	var (
+		tracks   []*statusTrack
+		rec      statusRecorder
+		pollWait func()
+		sctx     context.Context
+		scancel  context.CancelFunc
+	)
+	if l.hasStatus() {
+		tracks = make([]*statusTrack, len(l.Processes))
+		for i := range tracks {
+			tracks[i] = newStatusTrack()
+		}
+		rec = statusRecorder{log: writelog.WithTag(base, "procman/status")}
+		if ss, ok := l.Logs.(StatusSink); ok {
+			rec.sink = ss
+		}
+		// Fold statuses relayed from child processes into their parent's
+		// track, so a supervisor with no probe of its own still has a status
+		// (see ChildStatusSource).
+		if src, ok := l.Logs.(ChildStatusSource); ok {
+			src.AddStatusObserver(newChildStatusObserver(l.Processes, tracks))
+		}
+		// Status goroutines get their own cancel so they can be stopped (and
+		// waited for) before Run returns, without cancelling the caller's ctx.
+		sctx, scancel = context.WithCancel(ctx)
+		pollWait = l.startStatusPollers(sctx, tracks, rec, base)
+		defer scancel()
+	}
+
 	// Create one child channel per process per stream.  The LogSink owns the
 	// transport: it may render text to a terminal or frame records up to a
 	// parent formation.  Without a LogSink, process output falls back to the
@@ -283,33 +332,6 @@ func (l *Formation) Run(ctx context.Context) error {
 			}
 			ios[i] = childIO{stdout: stdout, stderr: stderr}
 		}
-	}
-
-	// Status: one track per process (created up front so a process that dies
-	// before its first poll still has a row), a poller per Process.Status, and
-	// the formation's own policy callback in the same errgroup — a fatal
-	// verdict there cancels the formation exactly like a process exit.
-	var (
-		tracks   []*statusTrack
-		rec      statusRecorder
-		pollWait func()
-		sctx     context.Context
-		scancel  context.CancelFunc
-	)
-	if l.hasStatus() {
-		tracks = make([]*statusTrack, len(l.Processes))
-		for i := range tracks {
-			tracks[i] = newStatusTrack()
-		}
-		rec = statusRecorder{log: writelog.WithTag(base, "procman/status")}
-		if ss, ok := l.Logs.(StatusSink); ok {
-			rec.sink = ss
-		}
-		// Status goroutines get their own cancel so they can be stopped (and
-		// waited for) before Run returns, without cancelling the caller's ctx.
-		sctx, scancel = context.WithCancel(ctx)
-		pollWait = l.startStatusPollers(sctx, tracks, rec, base)
-		defer scancel()
 	}
 
 	for i, p := range l.Processes {
@@ -437,7 +459,6 @@ func withExtraFiles(files []*os.File) runOption {
 	}
 }
 
-// TODO withEnvAdd is unused, and unusable from outside?
 func withEnvAdd(entries []string) runOption {
 	return func(o *runOptions) {
 		o.envAdd = entries

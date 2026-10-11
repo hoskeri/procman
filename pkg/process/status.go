@@ -3,6 +3,7 @@ package process
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -125,6 +126,20 @@ type statusTrack struct {
 	pid      int
 	exited   bool
 	code     int
+
+	// reported is true once the process's own Status callback has produced a
+	// verdict; relayed sub-component reports are then ignored.
+	reported bool
+	// subs holds the latest status of each sub-component relayed from a child
+	// process (keyed by its path below the process tag).  When the process
+	// itself never reports, the derived aggregate is what component() exposes.
+	subs map[string]subStatus
+	// subState/subReason/subDetail is the cached aggregate of subs so
+	// component() does no work per read; subSince is when it last changed.
+	subState  status.State
+	subReason string
+	subDetail string
+	subSince  time.Time
 }
 
 func newStatusTrack() *statusTrack {
@@ -166,18 +181,23 @@ func (t *statusTrack) isDone() bool {
 func (t *statusTrack) component() ComponentStatus {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	cs := ComponentStatus{
-		State:       t.state,
-		Reason:      t.reason,
-		Detail:      t.detail,
-		Since:       t.since,
-		Recoverable: t.state.Recoverable(),
-		Fatal:       t.state == status.StateFailed,
+	state, reason, detail, since := t.state, t.reason, t.detail, t.since
+	// A process that never reported for itself inherits its relayed
+	// sub-components' aggregate; an own report always wins.
+	if !t.reported && t.subState.Reported() {
+		state, reason, detail, since = t.subState, t.subReason, t.subDetail, t.subSince
+	}
+	return ComponentStatus{
+		State:       state,
+		Reason:      reason,
+		Detail:      detail,
+		Since:       since,
+		Recoverable: state.Recoverable(),
+		Fatal:       state == status.StateFailed,
 		PID:         t.pid,
 		Exited:      t.exited,
 		ExitCode:    t.code,
 	}
-	return cs
 }
 
 func (t *statusTrack) view(p *Process) ComponentStatus {
@@ -198,6 +218,107 @@ func (t *statusTrack) report(e *status.Error) {
 	t.state = e.State
 	t.reason = e.Reason
 	t.detail = e.Detail
+	t.reported = true
+}
+
+// subStatus is one relayed sub-component's latest report.
+type subStatus struct {
+	state  status.State
+	reason string
+	detail string
+}
+
+// reportSub records a status relayed for a sub-component of the process
+// (identity "<tag>/<sub>") and refreshes the derived aggregate.  It is
+// ignored by component() once the process has reported for itself.
+func (t *statusTrack) reportSub(sub string, st status.State, reason, detail string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.subs == nil {
+		t.subs = make(map[string]subStatus)
+	}
+	t.subs[sub] = subStatus{state: st, reason: reason, detail: detail}
+	state, reason2, detail2 := aggregateSubs(t.subs)
+	if state != t.subState || reason2 != t.subReason {
+		t.subSince = time.Now()
+	}
+	t.subState, t.subReason, t.subDetail = state, reason2, detail2
+}
+
+// aggregateSubs rolls a process's relayed sub-component states into one
+// verdict: the worst state wins, and its reason/detail explains it.  Unknown
+// sits below Healthy so a stray unreported sub cannot mask healthy ones.
+func aggregateSubs(subs map[string]subStatus) (status.State, string, string) {
+	var (
+		worst subStatus
+		have  bool
+	)
+	for _, s := range subs {
+		if !have || subSeverity(s.state) > subSeverity(worst.state) {
+			worst, have = s, true
+		}
+	}
+	if !have {
+		return status.StateUnknown, "", ""
+	}
+	return worst.state, worst.reason, worst.detail
+}
+
+// subSeverity ranks states for aggregateSubs (higher is worse).
+func subSeverity(s status.State) int {
+	switch s {
+	case status.StateFailed:
+		return 6
+	case status.StateUnhealthy:
+		return 5
+	case status.StateDegraded:
+		return 4
+	case status.StateStarting:
+		return 3
+	case status.StateHealthy:
+		return 2
+	case status.StateUnknown:
+		return 1
+	default: // StateUnknownProcess
+		return 0
+	}
+}
+
+// childStatusObserver folds statuses relayed from a child process into the
+// parent formation's tracks.  identity is "<process-tag>/<component>"; only
+// the leading process tag and that process's own track matter here.
+type childStatusObserver struct {
+	tracks map[string]*statusTrack
+}
+
+// newChildStatusObserver maps each process identity to its track, so a relayed
+// "<tag>/<sub>" status can be filed against the right process.
+func newChildStatusObserver(procs []*Process, tracks []*statusTrack) childStatusObserver {
+	m := make(map[string]*statusTrack, len(procs))
+	for i, p := range procs {
+		if p == nil || i >= len(tracks) {
+			continue
+		}
+		m[status.Identity(p.Tag, p.Index)] = tracks[i]
+	}
+	return childStatusObserver{tracks: m}
+}
+
+// ObserveStatus implements writelog.StatusObserver.
+func (o childStatusObserver) ObserveStatus(identity string, rec writelog.StatusRecord) {
+	tag, sub, ok := strings.Cut(identity, "/")
+	if !ok || sub == "" {
+		return
+	}
+	track, ok := o.tracks[tag]
+	if !ok {
+		return
+	}
+	st, ok := status.ParseState(rec.State)
+	if !ok {
+		return
+	}
+	track.reportSub(sub, st, rec.Reason, rec.Detail)
 }
 
 // statusRecorder is the internal view of the optional StatusSink plus the
@@ -222,11 +343,14 @@ func (r statusRecorder) report(identity string, e *status.Error) {
 		// Render a status as an ordinary record so it is visible without a
 		// status-aware consumer: "<tag> | FAILED <reason>".  A healthy status
 		// has no reason by construction, so it renders as just its state.
+		// EmitStatus lets the record cross a nested boundary even when the
+		// level policy would filter the line, so the parent's registry stays
+		// level-independent.
 		msg := e.Error()
 		if msg == "" {
 			msg = "ok"
 		}
-		r.log.LogAttrs(context.Background(), e.State.Level(), msg,
+		writelog.EmitStatus(context.Background(), r.log, e.State.Level(), msg,
 			slog.String(writelog.AttrStatus, e.State.String()))
 	}
 }

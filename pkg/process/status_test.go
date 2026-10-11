@@ -7,12 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/hoskeri/procman/pkg/status"
 	"github.com/hoskeri/procman/pkg/termhandler"
+	"github.com/hoskeri/procman/pkg/writelog"
 )
 
 // sleeper is a process that runs for a while, long enough for several status
@@ -379,4 +381,139 @@ func TestStatusViewHelpers(t *testing.T) {
 	if f := v.Fatal(); len(f) != 1 || f[0].Tag != "webhook" {
 		t.Errorf("Fatal() = %+v", f)
 	}
+}
+
+// TestRelayedChildStatusFeedsFormationView pins the supervisor roll-up: a
+// process with no Status callback of its own takes its state from the
+// sub-component statuses relayed up from a child (the node-a/kubelet,
+// node-a/criserver case), while an own report still wins.
+func TestRelayedChildStatusFeedsFormationView(t *testing.T) {
+	frm := &Formation{Processes: []*Process{{Tag: "node-a"}}}
+	tracks := []*statusTrack{newStatusTrack()}
+	tracks[0].started(4321)
+	obs := newChildStatusObserver(frm.Processes, tracks)
+
+	// Alive but silent: nothing relayed yet.
+	if c, _ := frm.view(tracks).Get("node-a"); c.State != status.StateUnknown {
+		t.Fatalf("no sub report should stay unknown: %+v", c)
+	}
+
+	obs.ObserveStatus("node-a/kubelet/status", writelog.StatusRecord{State: "healthy"})
+	obs.ObserveStatus("node-a/criserver/status", writelog.StatusRecord{State: "healthy"})
+	c, _ := frm.view(tracks).Get("node-a")
+	if c.State != status.StateHealthy {
+		t.Fatalf("all subs healthy should be healthy: %+v", c)
+	}
+	if c.PID != 4321 {
+		t.Errorf("liveness lost in roll-up: %+v", c)
+	}
+
+	// The worst sub wins, and its reason explains the aggregate.
+	obs.ObserveStatus("node-a/criserver/status", writelog.StatusRecord{State: "unhealthy", Reason: "cri down"})
+	c, _ = frm.view(tracks).Get("node-a")
+	if c.State != status.StateUnhealthy || c.Reason != "cri down" {
+		t.Fatalf("worst sub must win: %+v", c)
+	}
+	if !c.Recoverable || c.Fatal {
+		t.Errorf("unhealthy must stay recoverable: %+v", c)
+	}
+
+	// An own report overrides the sub aggregate.
+	tracks[0].report(status.Failed(nil, "supervisor dead"))
+	c, _ = frm.view(tracks).Get("node-a")
+	if c.State != status.StateFailed || !c.Fatal || c.Reason != "supervisor dead" {
+		t.Fatalf("own report must win over subs: %+v", c)
+	}
+
+	// Statuses for another process, or with an unknown state name, are ignored.
+	obs.ObserveStatus("node-b/kubelet/status", writelog.StatusRecord{State: "healthy"})
+	obs.ObserveStatus("node-a/kubelet/status", writelog.StatusRecord{State: "bogus"})
+	if got := len(tracks[0].subs); got != 2 {
+		t.Errorf("subs = %d, want 2", got)
+	}
+}
+
+// hookSink is a LogSink that captures the formation's ChildStatusSource hook,
+// so a test can fire relayed statuses without a child process.
+type hookSink struct {
+	mu    sync.Mutex
+	obs   []writelog.StatusObserver
+	lastV StatusView
+}
+
+func (s *hookSink) Logger() *slog.Logger { return slog.Default() }
+
+func (s *hookSink) ChildFDs(string, int, writelog.LevelResolver) (*os.File, *os.File, error) {
+	out, err := os.Open(os.DevNull)
+	if err != nil {
+		return nil, nil, err
+	}
+	errOut, err := os.Open(os.DevNull)
+	if err != nil {
+		out.Close()
+		return nil, nil, err
+	}
+	return out, errOut, nil
+}
+
+func (s *hookSink) AddStatusObserver(o writelog.StatusObserver) {
+	s.mu.Lock()
+	s.obs = append(s.obs, o)
+	s.mu.Unlock()
+}
+
+func (s *hookSink) observers() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.obs)
+}
+
+func (s *hookSink) fire(identity string, rec writelog.StatusRecord) {
+	s.mu.Lock()
+	obs := append([]writelog.StatusObserver(nil), s.obs...)
+	s.mu.Unlock()
+	for _, o := range obs {
+		o.ObserveStatus(identity, rec)
+	}
+}
+
+func (s *hookSink) record(v StatusView) {
+	s.mu.Lock()
+	s.lastV = v
+	s.mu.Unlock()
+}
+
+func (s *hookSink) latest() StatusView {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastV
+}
+
+// TestFormationRegistersChildStatusHook verifies Run installs the
+// ChildStatusSource hook before creating the child channels, and that a
+// relayed sub-component status then reaches the formation's status view.
+func TestFormationRegistersChildStatusHook(t *testing.T) {
+	sink := &hookSink{}
+	frm := &Formation{
+		Logs:           sink,
+		Processes:      []*Process{{Tag: "node-a", CmdArgs: sleeper}},
+		StatusInterval: 10 * time.Millisecond,
+		Status: func(ctx context.Context) error {
+			v, _ := StatusViewFromContext(ctx)
+			sink.record(v)
+			return nil
+		},
+	}
+	_, cancel := runFormationCtx(frm)
+	defer cancel()
+
+	waitFor(t, "the child status hook to be registered", func() bool { return sink.observers() > 0 })
+
+	sink.fire("node-a/kubelet/status", writelog.StatusRecord{State: "healthy"})
+	sink.fire("node-a/criserver/status", writelog.StatusRecord{State: "healthy"})
+
+	waitFor(t, "node-a to converge to healthy", func() bool {
+		c, ok := sink.latest().Get("node-a")
+		return ok && c.State == status.StateHealthy
+	})
 }

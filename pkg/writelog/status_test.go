@@ -153,3 +153,79 @@ func TestDualRelayObservesStatuses(t *testing.T) {
 		t.Errorf("re-emitted message = %q", seen[0].Message)
 	}
 }
+
+// TestEmitStatusBypassesLevelAtBoundary pins the level-independence of the
+// status path across a nested boundary: a Debug-level `healthy` status is
+// filtered from the log stream but must still cross to the parent's registry,
+// so it is observable under --log-level error.
+func TestEmitStatusBypassesLevelAtBoundary(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendFd := fds[1]
+	recvConn := SetupRecvConn(fds[0])
+
+	obs := newCollector()
+	var relayWg sync.WaitGroup
+	DualRelay(recvConn, slog.Default(), "child", StreamStdout, &relayWg, obs)
+	time.Sleep(10 * time.Millisecond)
+
+	framer := NewFramer(sendFd, StreamStdout, slog.LevelError)
+	logger := WithTag(slog.New(framer), "kubelet/status")
+	if logger.Handler().Enabled(context.Background(), slog.LevelDebug) {
+		t.Fatal("test premise: a Debug record must be filtered at Error level")
+	}
+
+	EmitStatus(context.Background(), logger, slog.LevelDebug, "ok", slog.String(AttrStatus, "healthy"))
+
+	select {
+	case <-obs.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a level-filtered status never reached the relay")
+	}
+	if recs := obs.records("child/kubelet/status"); len(recs) != 1 || recs[0].State != "healthy" {
+		t.Fatalf("observed %+v", recs)
+	}
+
+	syscall.Close(sendFd)
+	relayWg.Wait()
+	recvConn.Close()
+}
+
+// TestDualRelayFansOutToAllObservers verifies every non-nil observer receives a
+// relayed status, so a formation's hook (ChildStatusSource) can observe
+// alongside the sink's own registry.
+func TestDualRelayFansOutToAllObservers(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendFd := fds[1]
+	recvConn := SetupRecvConn(fds[0])
+
+	first, second := newCollector(), newCollector()
+	var relayWg sync.WaitGroup
+	DualRelay(recvConn, slog.Default(), "child", StreamStdout, &relayWg, nil, first, second)
+	time.Sleep(10 * time.Millisecond)
+
+	framer := NewFramer(sendFd, StreamStdout, slog.LevelDebug)
+	framer = framer.WithTag("api").(*FramerHandler)
+	slog.New(framer).LogAttrs(context.Background(), slog.LevelDebug, "ok",
+		slog.String(AttrStatus, "healthy"))
+
+	for i, obs := range []*collector{first, second} {
+		select {
+		case <-obs.ready:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("observer %d never saw the status", i)
+		}
+		if recs := obs.records("child/api"); len(recs) != 1 || recs[0].State != "healthy" {
+			t.Errorf("observer %d got %+v", i, recs)
+		}
+	}
+
+	syscall.Close(sendFd)
+	relayWg.Wait()
+	recvConn.Close()
+}

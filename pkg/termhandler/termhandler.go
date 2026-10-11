@@ -554,6 +554,12 @@ type TermHandler struct {
 	restore func()
 	relays  *relayState
 	status  *statusRegistry
+
+	// obsMu guards observers, the extra status hooks a formation registers so
+	// relayed sub-component statuses reach its own view (see
+	// process.ChildStatusSource).
+	obsMu     sync.Mutex
+	observers []writelog.StatusObserver
 }
 
 // New builds the output facade for a formation.
@@ -647,6 +653,20 @@ func (h *TermHandler) ObserveStatus(identity string, rec writelog.StatusRecord) 
 		return
 	}
 	h.status.observe(identity, rec)
+}
+
+// AddStatusObserver registers o to receive every status relayed from a child
+// channel, in addition to this handler's own registry.  A formation uses it
+// to fold a child's sub-component statuses into its own status view (see
+// process.ChildStatusSource).  Register before ChildFDs so no early status is
+// missed.  A nil observer is ignored.
+func (h *TermHandler) AddStatusObserver(o writelog.StatusObserver) {
+	if o == nil {
+		return
+	}
+	h.obsMu.Lock()
+	h.observers = append(h.observers, o)
+	h.obsMu.Unlock()
 }
 
 // ReportStatus publishes a status produced inside this process (a Process's
@@ -788,7 +808,17 @@ func (h *TermHandler) openChannel(tag string, stream writelog.StreamKind, sink *
 	// ordered before Close's wg.Wait.  Close flips closed under this same
 	// lock and only starts Wait after releasing it, so either this Add is
 	// visible to Wait or the closed check above rejects the channel.
-	writelog.DualRelay(recv, sink, tag, stream, &h.relays.wg, statusObserver{h.status})
+	// Snapshot the observers while holding obsMu; the handler's own registry is
+	// always first, and any formation hooks follow.
+	h.obsMu.Lock()
+	obs := make([]writelog.StatusObserver, 0, len(h.observers)+1)
+	if h.status != nil {
+		obs = append(obs, statusObserver{h.status})
+	}
+	obs = append(obs, h.observers...)
+	h.obsMu.Unlock()
+
+	writelog.DualRelay(recv, sink, tag, stream, &h.relays.wg, obs...)
 	h.relays.mu.Unlock()
 
 	return os.NewFile(uintptr(fds[1]), fmt.Sprintf("%s-%s", stream, tag)), nil

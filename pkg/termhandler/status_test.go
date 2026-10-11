@@ -268,3 +268,58 @@ func TestObserveStatusUnknownName(t *testing.T) {
 		t.Error("failed must not be recoverable")
 	}
 }
+
+// observedStatus is one status a hook saw.
+type observedStatus struct {
+	identity string
+	rec      writelog.StatusRecord
+}
+
+// statusHook is a writelog.StatusObserver that reports what it saw on a
+// channel, for the AddStatusObserver test.
+type statusHook struct {
+	got chan observedStatus
+}
+
+func newStatusHook() *statusHook { return &statusHook{got: make(chan observedStatus, 4)} }
+
+func (h *statusHook) ObserveStatus(identity string, rec writelog.StatusRecord) {
+	select {
+	case h.got <- observedStatus{identity: identity, rec: rec}:
+	default:
+	}
+}
+
+// TestAddStatusObserverReceivesRelayedStatuses verifies the formation's hook:
+// a status relayed from a child channel reaches a registered observer in
+// addition to the handler's own registry, with the child-prefixed identity.
+func TestAddStatusObserverReceivesRelayedStatuses(t *testing.T) {
+	th := New(context.Background(), nil, nil, nil, &Options{Plain: true})
+	defer th.Close()
+
+	hook := newStatusHook()
+	th.AddStatusObserver(hook)
+
+	out, errFD, err := th.ChildFDs("node-a", 0, nil)
+	if err != nil {
+		t.Fatalf("ChildFDs: %v", err)
+	}
+	defer out.Close()
+	defer errFD.Close()
+
+	framer := writelog.NewFramer(int(out.Fd()), writelog.StreamStdout, slog.LevelDebug)
+	logger := writelog.WithTag(slog.New(framer), "kubelet/status")
+	logger.LogAttrs(context.Background(), slog.LevelDebug, "ok", slog.String(writelog.AttrStatus, "healthy"))
+
+	select {
+	case got := <-hook.got:
+		if got.identity != "node-a/kubelet/status" {
+			t.Errorf("identity = %q, want node-a/kubelet/status", got.identity)
+		}
+		if got.rec.State != "healthy" {
+			t.Errorf("record = %+v", got.rec)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("registered observer never saw the relayed status")
+	}
+}

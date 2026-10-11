@@ -60,17 +60,22 @@ type StatusObserver interface {
 // This avoids any frame-decode overhead on text messages.
 //
 // wg is optional; when non-nil, Add(1) is called before the loop and Done
-// after it exits.  obs is optional; when set it receives the status records
-// carried by relayed frames.
+// after it exits.  obs is optional; every non-nil observer receives the
+// status records carried by relayed frames (the sink's own registry first,
+// then any hooks a formation registered via its LogSink).
 func DualRelay(recv *net.UnixConn, parentSink *slog.Logger, childTag string, channelStream StreamKind, wg *sync.WaitGroup, obs ...StatusObserver) {
 	if wg != nil {
 		wg.Add(1)
 	}
-	var observer StatusObserver
+	var observers multiObserver
 	for _, o := range obs {
 		if o != nil {
-			observer = o
+			observers = append(observers, o)
 		}
+	}
+	var observer StatusObserver
+	if len(observers) > 0 {
+		observer = observers
 	}
 	go func() {
 		if wg != nil {
@@ -78,6 +83,18 @@ func DualRelay(recv *net.UnixConn, parentSink *slog.Logger, childTag string, cha
 		}
 		dualRelayLoop(recv, parentSink, childTag, channelStream, observer)
 	}()
+}
+
+// multiObserver fans a relayed status out to every registered observer in
+// order.  The sink's own registry is the first observer; later ones are
+// formation hooks that fold a child's sub-component statuses into the
+// parent's view (see process.ChildStatusSource).
+type multiObserver []StatusObserver
+
+func (m multiObserver) ObserveStatus(identity string, rec StatusRecord) {
+	for _, o := range m {
+		o.ObserveStatus(identity, rec)
+	}
 }
 
 // textBuf accumulates partial (unterminated) lines across successive

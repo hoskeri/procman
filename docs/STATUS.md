@@ -425,6 +425,18 @@ the row left as `StateUnknownProcess`, per §5) when the process is gone:
 consulted, so a dead process is never polled and a pid that the OS has
 recycled cannot make a dead child look alive.
 
+**A process with no `Status` callback still gets a state from its children.**
+A supervisor may have no probe of its own while its real components run deeper
+(a node whose kubelet and CRI server are probed inside a sandbox). Those
+sub-components report on the process's child channel as
+`<process>/<component>`, and the relay hook (`process.ChildStatusSource`,
+implemented by `termhandler.TermHandler.AddStatusObserver`) folds them onto the
+process's track: the worst sub-component state wins, and an own report (when
+present) always takes precedence. Sub-component statuses are also
+level-independent (see §5): a child's `healthy` line crosses a nested boundary
+even under `--log-level error`, because it is the parent's registry that
+observes it, while the parent still applies its own level when rendering.
+
 `pollInterval` continues to exist unchanged for exit polling; status is
 orthogonal.
 
