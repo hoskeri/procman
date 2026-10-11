@@ -79,6 +79,11 @@ type ChildStatusSource interface {
 
 // Formation is the set of process from a procfile.
 type Formation struct {
+	// Name is the formation's application name, used as the display tag for
+	// the formation's own lifecycle records (and as the prefix of its status
+	// row).  It defaults to "procman" and must satisfy the same naming rules
+	// as a process tag (procfile.ValidTag).
+	Name      string
 	Workdir   string
 	Processes []*Process
 	// Logs is the output facade.  When nil, child output falls back to the
@@ -148,10 +153,8 @@ func (l *Formation) Load(src io.ReadCloser) error {
 
 	ps := []*Process{}
 	for _, r := range records {
-		// TODO tag validation should be in procfile parsing.
-		if !validTag(r.Tag) {
-			return fmt.Errorf("process tag %q: must be lowercase alphanumeric (may contain dashes)", r.Tag)
-		}
+		// Tag naming is enforced by procfile.Parse, the single source of truth
+		// for the Procfile syntax.
 		if len(r.CmdArgs) == 0 {
 			// e.g. a line like "web:" — shellwords parses the empty command
 			// into no arguments. Fail fast here instead of panicking on
@@ -196,7 +199,7 @@ func (p *Process) resolver(levels LogLevels) writelog.LevelResolver {
 
 // applies reports whether levels overrides anything for p (i.e. the formation
 // carries an explicit policy rather than the zero value).
-func (levels LogLevels) applies(p *Process) bool {
+func applies(levels LogLevels, p *Process) bool {
 	if p.LogLevel != 0 {
 		return true
 	}
@@ -219,7 +222,7 @@ type levelSetter interface {
 // It backs the writelog fallback used when Formation.Logs is nil; the LogSink
 // path receives the level directly through ChildFDs.
 func (p *Process) loggerFor(base *slog.Logger, levels LogLevels) *slog.Logger {
-	if base == nil || !levels.applies(p) {
+	if base == nil || !applies(levels, p) {
 		return base
 	}
 	if ls, ok := base.Handler().(levelSetter); ok {
@@ -228,25 +231,12 @@ func (p *Process) loggerFor(base *slog.Logger, levels LogLevels) *slog.Logger {
 	return base
 }
 
-// validTag reports whether tag conforms to the enforced naming convention:
-// lowercase alphanumeric, may contain interior dashes (no leading/trailing).
-func validTag(tag string) bool {
-	if len(tag) == 0 {
-		return false
-	}
-	if tag[0] == '-' || tag[len(tag)-1] == '-' {
-		return false
-	}
-	for _, c := range tag {
-		switch {
-		case c >= 'a' && c <= 'z':
-		case c >= '0' && c <= '9':
-		case c == '-':
-		default:
-			return false
-		}
-	}
-	return true
+// event emits a formation lifecycle event under the formation's tag.  It goes
+// through writelog.EmitStatus so a nested formation forwards the record to its
+// parent even when the level policy would filter it; the level is Error so the
+// event stays visible by default.
+func event(log *slog.Logger, msg string, attrs ...slog.Attr) {
+	writelog.EmitStatus(context.Background(), log, slog.LevelError, msg, attrs...)
 }
 
 // Run executes every process concurrently. The first process to exit on its
@@ -262,6 +252,14 @@ func validTag(tag string) bool {
 // process is nested inside a parent formation.  When Logs is nil, output goes
 // through the writelog text pipeline into slog.Default().
 func (l *Formation) Run(ctx context.Context) error {
+	name := l.Name
+	if name == "" {
+		name = "procman"
+	}
+	if !procfile.ValidTag(name) {
+		return fmt.Errorf("formation name %q: must be lowercase alphanumeric (may contain dashes)", name)
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -271,13 +269,10 @@ func (l *Formation) Run(ctx context.Context) error {
 	if l.Logs != nil {
 		base = l.Logs.Logger()
 	}
-	// The formation's own lifecycle records are tagged "procman" (a display
-	// tag, not an attribute namespace) so the renderer prefixes them.
-
-	// TODO: unhardcode "procman" from here. I want to be able to customize
-	// application names. Add a field in Formation called "Name", use it here.
-	// Name has the same validation rules as tags.
-	procmanLog := writelog.WithTag(base, "procman")
+	// The formation's own lifecycle records are tagged with the formation
+	// name (a display tag, not an attribute namespace) so the renderer
+	// prefixes them.
+	procmanLog := writelog.WithTag(base, name)
 
 	// Status: one track per process (created up front so a process that dies
 	// before its first poll still has a row), a poller per Process.Status, and
@@ -298,7 +293,7 @@ func (l *Formation) Run(ctx context.Context) error {
 		for i := range tracks {
 			tracks[i] = newStatusTrack()
 		}
-		rec = statusRecorder{log: writelog.WithTag(base, "procman/status")}
+		rec = statusRecorder{log: writelog.WithTag(base, name+"/status")}
 		if ss, ok := l.Logs.(StatusSink); ok {
 			rec.sink = ss
 		}
@@ -346,7 +341,11 @@ func (l *Formation) Run(ctx context.Context) error {
 				defer ch.stdout.Close()
 				defer ch.stderr.Close()
 			}
-			procmanLog.Warn(fmt.Sprintf("starting %s", p.Tag))
+			// Lifecycle events go through writelog.EmitStatus so a nested
+			// formation forwards them to its parent even when the level policy
+			// would filter them; Error keeps them visible by default under the
+			// formation's tag.
+			event(procmanLog, "starting "+p.Tag)
 			logger := base
 			if l.Logs == nil {
 				logger = p.loggerFor(base, l.LogLevels)
@@ -362,16 +361,20 @@ func (l *Formation) Run(ctx context.Context) error {
 					if tracks != nil {
 						tracks[i].started(pid)
 					}
+					event(procmanLog, "started "+p.Tag, slog.Int("pid", pid))
 				}),
 			)
+			code := exitCodeOf(err)
 			if tracks != nil {
-				tracks[i].exitedProcess(exitCodeOf(err))
+				tracks[i].exitedProcess(code)
 				if rec.sink != nil {
-					rec.sink.ProcessExited(status.Identity(p.Tag, p.Index), exitCodeOf(err))
+					rec.sink.ProcessExited(status.Identity(p.Tag, p.Index), code)
 				}
 			}
 			if err != nil {
-				procmanLog.Warn(err.Error())
+				// A process that exited on its own ended the formation.
+				event(procmanLog, "exited "+p.Tag,
+					slog.Int("code", code), slog.String("err", err.Error()))
 			}
 			return err
 		})
@@ -381,7 +384,7 @@ func (l *Formation) Run(ctx context.Context) error {
 		eg.Go(func() error {
 			err := l.formationStatusLoop(sctx, tracks, rec)
 			if err != nil {
-				procmanLog.Error("formation status", "err", err)
+				event(procmanLog, "formation status", slog.String("err", err.Error()))
 			}
 			return err
 		})
@@ -497,7 +500,7 @@ func (p *Process) run(ctx context.Context, opt ...runOption) error {
 	}
 	o.Apply(opt...)
 
-	if !validTag(p.Tag) {
+	if !procfile.ValidTag(p.Tag) {
 		return fmt.Errorf("%s: tag must be lowercase alphanumeric (may contain dashes)", p.Tag)
 	}
 	if len(p.CmdArgs) == 0 {

@@ -16,6 +16,29 @@ type Record struct {
 	CmdArgs []string
 }
 
+// ValidTag reports whether tag conforms to the enforced naming convention:
+// lowercase alphanumeric, may contain interior dashes (no leading/trailing).
+// It is the single source of truth for process tags, formation names, and
+// component identities.
+func ValidTag(tag string) bool {
+	if len(tag) == 0 {
+		return false
+	}
+	if tag[0] == '-' || tag[len(tag)-1] == '-' {
+		return false
+	}
+	for _, c := range tag {
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9':
+		case c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // Parse parses Procfile data from src. Blank lines and lines starting with
 // '#' are skipped. Every other line is split at the first ':' into a Tag and
 // a Command; the command is parsed into arguments with shellwords. The
@@ -43,6 +66,9 @@ func Parse(src io.ReadCloser) ([]Record, error) {
 		tag, cmd, found := strings.Cut(line, ":")
 		if !found {
 			return nil, fmt.Errorf("invalid line %d", lineNum)
+		}
+		if !ValidTag(tag) {
+			return nil, fmt.Errorf("line %d: process tag %q: must be lowercase alphanumeric (may contain dashes)", lineNum, tag)
 		}
 
 		cmdArgs, err := shellwords.Parse(cmd)

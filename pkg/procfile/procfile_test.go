@@ -8,6 +8,32 @@ import (
 	"github.com/google/go-cmp/cmp"
 )
 
+func TestValidTag(t *testing.T) {
+	tests := []struct {
+		tag string
+		ok  bool
+	}{
+		{"web", true},
+		{"web-1", true},
+		{"node", true},
+		{"node-1", true},
+		{"a", true},
+		{"0", true},
+		{"", false},
+		{"WEB", false},
+		{"Web_1", false},
+		{"web.server", false},
+		{"web 1", false},
+		{"-web", false},
+		{"web-", false},
+	}
+	for _, tt := range tests {
+		if got := ValidTag(tt.tag); got != tt.ok {
+			t.Errorf("ValidTag(%q) = %v, want %v", tt.tag, got, tt.ok)
+		}
+	}
+}
+
 func TestParse(t *testing.T) {
 	testCases := []struct {
 		name    string
@@ -32,10 +58,22 @@ func TestParse(t *testing.T) {
 			},
 		},
 		{
-			name: "malformed line reports its number",
-			data: "web: ./server\ndb ./mysql",
+			name:    "malformed line reports its number",
+			data:    "web: ./server\ndb ./mysql",
 			wantErr: true,
 			errMsg:  "invalid line 2",
+		},
+		{
+			name:    "invalid tag rejected",
+			data:    "web: ./server\nWeb: ./other",
+			wantErr: true,
+			errMsg:  `line 2: process tag "Web"`,
+		},
+		{
+			name:    "empty tag rejected",
+			data:    ": ./server",
+			wantErr: true,
+			errMsg:  "process tag",
 		},
 	}
 

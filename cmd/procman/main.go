@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/hoskeri/procman/pkg/loglevels"
 	"github.com/hoskeri/procman/pkg/process"
 	"github.com/hoskeri/procman/pkg/status"
 	"github.com/hoskeri/procman/pkg/termhandler"
@@ -22,7 +23,10 @@ type procFlags struct {
 	Output    string
 	Columns   int
 	Workdir   string
+	Name      string
 	Debug     bool
+	// LogLevel is the parsed --log-level policy; nil until AddFlags runs.
+	LogLevel *loglevels.Value
 }
 
 func (p *procFlags) AddFlags(fs *pflag.FlagSet) {
@@ -32,7 +36,10 @@ func (p *procFlags) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&p.Formation, "formation", "", "optional map of process type=replica-count")
 	fs.StringVar(&p.Output, "output", "auto", "output mode: auto,term")
 	fs.IntVar(&p.Columns, "columns", 0, "truncate log lines to this many characters (0 = terminal width, <0 = no truncation)")
+	fs.StringVar(&p.Name, "name", "procman", "application name used to tag the formation's own log lines")
 	fs.BoolVar(&p.Debug, "debug", false, "enable debug logging")
+	p.LogLevel = loglevels.NewValue(slog.LevelInfo)
+	fs.Var(p.LogLevel, "log-level", "log level policy: a level, or level plus tag=level overrides (e.g. info,api=debug)")
 }
 
 func main() {
@@ -41,10 +48,12 @@ func main() {
 	pflag.CommandLine.SortFlags = true
 	pflag.Parse()
 
-	ll := slog.LevelInfo
-	if p.Debug {
-		ll = slog.LevelDebug
+	if p.Debug && !p.LogLevel.Changed() {
+		// --debug is a convenience for --log-level debug; an explicit
+		// --log-level (even one carrying only tag overrides) wins.
+		p.LogLevel.SetDefault(slog.LevelDebug)
 	}
+	ll := p.LogLevel.Levels().Default
 
 	// The signal context is the formation's lifetime; the termhandler uses it
 	// to restore terminal state and stop relay goroutines on shutdown.
@@ -79,8 +88,10 @@ func main() {
 	}
 
 	fm := process.Formation{
-		Workdir: p.Workdir,
-		Logs:    logs,
+		Name:      p.Name,
+		Workdir:   p.Workdir,
+		Logs:      logs,
+		LogLevels: p.LogLevel.Levels(),
 	}
 
 	if err := fm.LoadFile(p.Procfile); err != nil {
