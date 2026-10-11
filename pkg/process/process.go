@@ -273,6 +273,10 @@ func (l *Formation) Run(ctx context.Context) error {
 	}
 	// The formation's own lifecycle records are tagged "procman" (a display
 	// tag, not an attribute namespace) so the renderer prefixes them.
+
+	// TODO: unhardcode "procman" from here. I want to be able to customize
+	// application names. Add a field in Formation called "Name", use it here.
+	// Name has the same validation rules as tags.
 	procmanLog := writelog.WithTag(base, "procman")
 
 	// Status: one track per process (created up front so a process that dies

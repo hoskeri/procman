@@ -1,5 +1,6 @@
 package process
 
+// TODO refactor to pkg/loglevels
 import (
 	"fmt"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 // level name sets Default, and tag=level entries override individual process
 // tags.  Embedders that build a Formation programmatically can set LogLevels
 // directly; CLI frontends can use ParseLogLevels.
+// TODO: expose this as a pflag custom type, let it fit naturally info flag parsers.
 type LogLevels struct {
 	// Default applies to any tag without an override.  The zero value is
 	// slog.LevelInfo.
